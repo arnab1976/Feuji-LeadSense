@@ -1,0 +1,59 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: leadsense
+      POSTGRES_PASSWORD: leadsense
+      POSTGRES_DB: leadsense
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U leadsense"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  api:
+    build: ./backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://leadsense:leadsense@db:5432/leadsense
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      CELERY_TASK_ALWAYS_EAGER: "false"
+      ENABLE_PGVECTOR: "true"
+    volumes: ["./backend:/app"]
+    ports: ["8000:8000"]
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_started}
+
+  worker:
+    build: ./backend
+    command: celery -A app.workers.celery_app.celery worker -l info -Q default,extraction,delivery
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://leadsense:leadsense@db:5432/leadsense
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      CELERY_TASK_ALWAYS_EAGER: "false"
+    volumes: ["./backend:/app"]
+    depends_on: [db, redis]
+
+  web:
+    build: ./frontend
+    command: npm run dev
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000/api/v1
+    volumes: ["./frontend:/app", "/app/node_modules"]
+    ports: ["3000:3000"]
+    depends_on: [api]
+
+volumes:
+  pgdata:
