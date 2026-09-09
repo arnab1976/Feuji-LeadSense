@@ -6,7 +6,7 @@
  * and nowhere else.
  */
 export const API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api/v1";
+  process.env.NEXT_PUBLIC_API_BASE_URL || "/api/v1";
 
 const TOKEN_KEY = "leadsense.token";
 const USER_KEY = "leadsense.user";
@@ -62,12 +62,24 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
   const text = await res.text();
-  const payload = text ? JSON.parse(text) : null;
+  let payload: unknown = null;
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      throw new ApiError(
+        `API returned HTML instead of JSON (${res.status}). Confirm the backend is running on port 8000.`,
+        res.status,
+        text.slice(0, 160)
+      );
+    }
+  }
 
   if (!res.ok) {
+    const body = payload as { message?: string; detail?: unknown } | null;
     const message =
-      (payload && (payload.message || payload.detail)) || `Request failed (${res.status})`;
-    throw new ApiError(String(message), res.status, payload?.detail);
+      (body && (body.message || body.detail)) || `Request failed (${res.status})`;
+    throw new ApiError(String(message), res.status, body?.detail);
   }
   return payload as T;
 }

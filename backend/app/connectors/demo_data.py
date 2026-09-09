@@ -2,6 +2,9 @@
 
 This is what makes ``git clone && make seed && make api`` produce a full working
 demo. Nothing here is real data.
+
+Uploaded titles deliberately differ from canonical titles for many records so
+Verification produces MATCH / MISMATCH / NEEDS_REVIEW cases.
 """
 from __future__ import annotations
 
@@ -9,6 +12,7 @@ import hashlib
 
 from app.connectors.base import RawLead
 
+# (name, uploaded_title, canonical_title, company, legal, city, industry, hc, tech)
 _PEOPLE = [
     ("Priya Raghavan", "VP Operations", "Vice President - Banking Operations",
      "Northbridge Bank", "Northbridge Bank Ltd", "Mumbai", "Banking", 8400,
@@ -46,6 +50,22 @@ _PEOPLE = [
     ("Aisha Khan", "Chief Information Officer", "Chief Information Officer",
      "Quantile Labs", "Quantile Labs Corp", "Toronto", "IT services", 9800,
      ["Azure", "Snowflake"]),
+    # Workflow "Technology buyers" CSV people — mismatched titles for the human gate.
+    ("Aisha Rahman", "VP Engineering", "Vice President of Engineering",
+     "Nimbus Data", "Nimbus Data Inc", "Bengaluru", "Software", 720,
+     ["Kubernetes", "AWS"]),
+    ("Marcus Chen", "Director of Platform", "Director, Platform Engineering",
+     "Orbitly", "Orbitly Pte Ltd", "Singapore", "Software", 410,
+     ["GCP", "Terraform"]),
+    ("Priya Nair", "Head of Data", "Head of Data Platform",
+     "Stacklane", "Stacklane Technologies Ltd", "Hyderabad", "Software", 980,
+     ["Databricks", "Snowflake"]),
+    ("Jonah Wells", "CTO", "Chief Technology Officer",
+     "BrightOps", "BrightOps Inc", "Austin", "Software", 260,
+     ["AWS", "Kubernetes"]),
+    ("Elena Petrova", "VP Product", "Vice President of Product",
+     "Quantora", "Quantora GmbH", "Berlin", "Software", 540,
+     ["React", "Postgres"]),
 ]
 
 
@@ -54,12 +74,7 @@ def _slug(value: str) -> str:
 
 
 def demo_leads(source: str, limit: int = 100, offset: int = 0) -> list[RawLead]:
-    """Deterministic synthetic leads.
-
-    The uploaded ``title`` deliberately differs from the canonical title for some
-    records so the Verification agent has real MATCH / MISMATCH / NEEDS_REVIEW
-    cases to produce rather than a table of green ticks.
-    """
+    """Deterministic synthetic leads."""
     leads: list[RawLead] = []
     window = (_PEOPLE + _PEOPLE)[offset:offset + limit]
     for idx, (name, uploaded_title, _canonical, company, legal, city,
@@ -95,3 +110,7 @@ def canonical_profile(full_name: str) -> dict:
                 "employee_count": headcount, "tech_stack": tech,
             }
     return {}
+
+
+def demo_people_names() -> list[str]:
+    return [row[0] for row in _PEOPLE]

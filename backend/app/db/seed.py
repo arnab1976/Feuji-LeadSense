@@ -38,9 +38,12 @@ CONNECTIONS = [
     ("Spreadsheet uploads", "manual_upload", {}, True, "legitimate_interest"),
     ("Salesforce production", "salesforce", {"object": "Lead"}, True, "contract"),
     ("HubSpot marketing", "hubspot", {"lifecycle_stage": "lead"}, True, "consent"),
+    ("ZoomInfo enrichment", "zoominfo", {}, True, "legitimate_interest"),
+    ("Web profile public pages", "web_profile", {}, True, "legitimate_interest"),
+    ("CSV feed URL/S3", "csv_url", {}, True, "legitimate_interest"),
     ("Apollo prospecting", "apollo",
      {"person_titles": "VP Operations, Head of Data, Chief Data Officer",
-      "employee_ranges": "201,10000"}, False, "unknown"),
+      "employee_ranges": "201,10000"}, True, "legitimate_interest"),
 ]
 
 DOCUMENTS = [

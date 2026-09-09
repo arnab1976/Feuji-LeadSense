@@ -28,6 +28,7 @@ HEADER_ALIASES: dict[str, list[str]] = {
     "phone": ["phone", "phonenumber", "mobile", "telephone", "contactnumber"],
     "industry": ["industry", "sector", "vertical"],
     "employee_count": ["employeecount", "employees", "companysize", "headcount", "size"],
+    "tech_stack": ["techstack", "technology", "technologies", "tools", "stack"],
 }
 
 
@@ -119,6 +120,10 @@ class ManualUploadConnector(SourceConnector):
                 headcount = int(float(val("employee_count") or 0))
             except ValueError:
                 headcount = 0
+            tech_stack = [
+                item.strip() for item in val("tech_stack").replace("|", ";").split(";")
+                if item.strip()
+            ]
 
             lead = RawLead(
                 external_id=f"row-{int(idx) + 1 + skip}",
@@ -131,6 +136,7 @@ class ManualUploadConnector(SourceConnector):
                 phone=val("phone"),
                 industry=val("industry"),
                 employee_count=headcount,
+                tech_stack=tech_stack,
                 source=self.key,
                 raw={str(k): str(v) for k, v in row.to_dict().items()},
             )

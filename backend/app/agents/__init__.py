@@ -38,10 +38,20 @@ def get_agent(key: str) -> BaseAgent:
 
 
 def catalog() -> list[dict]:
-    return [
-        {"number": idx + 1, **cls.describe()}
-        for idx, cls in enumerate(AGENT_CLASSES)
-    ]
+    """Orchestrator is listed first but not numbered with lead-processing agents."""
+    out: list[dict] = []
+    agent_num = 0
+    for cls in AGENT_CLASSES:
+        item = cls.describe()
+        if getattr(cls, "kind", "agent") == "orchestrator" or cls.key == "supervisor":
+            item["number"] = 0
+            item["kind"] = "orchestrator"
+        else:
+            agent_num += 1
+            item["number"] = agent_num
+            item["kind"] = item.get("kind") or "agent"
+        out.append(item)
+    return out
 
 
 __all__ = ["AGENTS", "AGENT_CLASSES", "AgentContext", "AgentResult", "BaseAgent",

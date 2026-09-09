@@ -52,11 +52,16 @@ class BaseAgent(ABC):
     key: str = ""
     name: str = ""
     role: str = ""
+    definition: str = ""
+    summary: str = ""
+    description: str = ""
     inputs: str = ""
     execution_strategy: str = ""
     outputs: str = ""
     stack: str = ""
+    stage: str = ""
     version: str = "v1"
+    kind: str = "agent"  # "agent" | "orchestrator"
 
     @abstractmethod
     def execute(self, ctx: AgentContext, **kwargs) -> AgentResult:
@@ -94,8 +99,21 @@ class BaseAgent(ABC):
 
     @classmethod
     def describe(cls) -> dict[str, Any]:
+        summary = cls.summary or cls.role
+        definition = cls.definition or (cls.__doc__ or "").strip().split("\n\n")[0].strip()
+        description = cls.description or cls.execution_strategy
         return {
-            "key": cls.key, "name": cls.name, "role": cls.role,
-            "inputs": cls.inputs, "execution_strategy": cls.execution_strategy,
-            "outputs": cls.outputs, "stack": cls.stack, "version": cls.version,
+            "key": cls.key,
+            "name": cls.name,
+            "role": cls.role,
+            "summary": summary,
+            "definition": definition,
+            "description": description,
+            "inputs": cls.inputs,
+            "execution_strategy": cls.execution_strategy,
+            "outputs": cls.outputs,
+            "stack": cls.stack,
+            "stage": cls.stage,
+            "version": cls.version,
+            "kind": getattr(cls, "kind", "agent"),
         }

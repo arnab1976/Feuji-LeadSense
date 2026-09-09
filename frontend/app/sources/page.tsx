@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { Connector, SourceConnection } from "@/lib/types";
@@ -22,6 +23,11 @@ function Sources() {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
+  const [lastRun, setLastRun] = useState<{
+    workflowId: string;
+    paused: boolean;
+    openConflicts: number;
+  } | null>(null);
 
   const load = () => {
     api.get<Connector[]>("/sources/catalog").then(setCatalog).catch((e) => setError(e.message));
@@ -89,9 +95,20 @@ function Sources() {
         limit: 25,
         run_pipeline: true,
       });
+      const pauseNote =
+        res.paused_at || res.open_conflicts
+          ? ` Pipeline paused at ${res.paused_at || "verification"} with ${res.open_conflicts || 0} conflict(s) — open Verification to review.`
+          : "";
       setMessage(
-        `Fetched ${res.fetched}, created ${res.created}, ${res.duplicates} duplicate, ${res.invalid} invalid.`
+        `Fetched ${res.fetched}, created ${res.created}, ${res.duplicates} duplicate, ${res.invalid} invalid.` +
+          (res.workflow_id ? ` Workflow ${res.workflow_id}.` : "") +
+          pauseNote
       );
+      setLastRun({
+        workflowId: res.workflow_id || "",
+        paused: Boolean(res.paused_at || res.open_conflicts),
+        openConflicts: res.open_conflicts || 0,
+      });
       load();
     } catch (e: any) {
       setError(e.message);
@@ -123,7 +140,40 @@ function Sources() {
       <Notice kind="error">{error}</Notice>
       <Notice kind="success">{message}</Notice>
 
-      <UploadCard onDone={(m) => { setMessage(m); load(); }} onError={setError} />
+      {lastRun?.paused ? (
+        <div className="card" style={{ borderColor: "var(--amber, #d4a017)", marginBottom: 16 }}>
+          <h2 style={{ marginTop: 0 }}>Pipeline paused — human review</h2>
+          <p className="hint" style={{ marginBottom: 12 }}>
+            Verification found {lastRun.openConflicts} conflict
+            {lastRun.openConflicts === 1 ? "" : "s"}. Enrichment and scoring stay
+            blocked until a reviewer resolves them
+            {lastRun.workflowId ? (
+              <>
+                {" "}
+                (workflow <span className="mono">{lastRun.workflowId}</span>)
+              </>
+            ) : null}
+            .
+          </p>
+          <div className="row">
+            <Link className="btn" href="/verification">
+              Open Verification
+            </Link>
+            <Link className="btn secondary" href="/workflow">
+              View Workflow
+            </Link>
+          </div>
+        </div>
+      ) : null}
+
+      <UploadCard
+        onDone={(m, meta) => {
+          setMessage(m);
+          if (meta) setLastRun(meta);
+          load();
+        }}
+        onError={setError}
+      />
 
       <div className="card">
         <h2>Configured connections</h2>
@@ -292,7 +342,10 @@ function UploadCard({
   onDone,
   onError,
 }: {
-  onDone: (message: string) => void;
+  onDone: (
+    message: string,
+    meta?: { workflowId: string; paused: boolean; openConflicts: number }
+  ) => void;
   onError: (message: string) => void;
 }) {
   const [file, setFile] = useState<File | null>(null);
@@ -321,11 +374,18 @@ function UploadCard({
       form.append("mapping_json", JSON.stringify(preview?.mapping || {}));
       form.append("run_pipeline", "true");
       const res = await api.upload<any>("/sources/upload", form);
+      const paused = Boolean(res.paused_at || res.open_conflicts);
       onDone(
         `Ingested ${res.rows_valid} of ${res.rows_read} rows (${res.rows_duplicate} duplicate, ${res.rows_invalid} invalid).` +
-          (res.open_conflicts
-            ? ` ${res.open_conflicts} conflicts need review.`
-            : "")
+          (res.workflow_id ? ` Workflow ${res.workflow_id}.` : "") +
+          (paused
+            ? ` Pipeline paused — ${res.open_conflicts || 0} conflict(s) need review.`
+            : ""),
+        {
+          workflowId: res.workflow_id || "",
+          paused,
+          openConflicts: res.open_conflicts || 0,
+        }
       );
       setFile(null);
       setPreview(null);
@@ -341,7 +401,9 @@ function UploadCard({
       <h2>Manual upload</h2>
       <p className="hint">
         Drop a CSV or Excel file. Columns are detected automatically and shown
-        before anything is ingested.
+        before anything is ingested. Free demo packs:{" "}
+        <span className="mono">backend/fixtures/demo/*.csv</span> (BFSI, life
+        sciences, SaaS).
       </p>
       <div className="row">
         <input

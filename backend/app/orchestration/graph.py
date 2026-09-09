@@ -60,15 +60,88 @@ class LeadPipeline:
         self.supervisor = SupervisorAgent()
 
     def run(self, lead_ids: list[str], weights: dict | None = None) -> dict:
-        state: dict = {"lead_ids": lead_ids, "open_conflicts": 0}
-        self.supervisor.checkpoint(self.ctx, "pipeline.start",
-                                   {"lead_ids": lead_ids})
+        """Start after Agent 01 Ingestion has returned ``lead_ids``.
 
-        for node in PIPELINE:
+        The Workflow Orchestrator checkpoints ``pipeline.start``, then drives
+        extraction → verification (human gate) → enrichment → scoring.
+        """
+        state: dict = {"lead_ids": lead_ids, "open_conflicts": 0}
+        self._checkpoint(
+            "pipeline.start",
+            {"lead_ids": lead_ids, "handed_off_from": "ingestion"},
+            status="running",
+        )
+        return self._execute(state, start_at=0, weights=weights)
+
+    def resume(self, weights: dict | None = None) -> dict:
+        """Continue a paused workflow from the node after the human gate.
+
+        Recounts open verification conflicts from the database. If any remain,
+        the workflow stays paused; otherwise enrichment and scoring run on the
+        same ``workflow_id``.
+        """
+        row = self.supervisor.load(self.ctx)
+        state = dict(row.state or {})
+        lead_ids = list(state.get("lead_ids") or [])
+        if not lead_ids:
+            log.info("workflow %s has no lead_ids to resume", self.ctx.workflow_id)
+            return {"status": row.status, "message": "no lead_ids in workflow state"}
+
+        open_conflicts = self._count_open_conflicts(lead_ids)
+        state["open_conflicts"] = open_conflicts
+        state["lead_ids"] = lead_ids
+
+        if open_conflicts > 0:
+            self._checkpoint(
+                row.current_node or "verification",
+                {"open_conflicts": open_conflicts, "awaiting_human_review": True},
+                status="paused",
+                paused_reason=f"{open_conflicts} verification conflicts still open",
+            )
+            state["paused_at"] = state.get("paused_at") or "verification"
+            state["pause_reason"] = f"{open_conflicts} verification conflicts still open"
+            state["status"] = "paused"
+            state["awaiting_human_review"] = True
+            return state
+
+        paused_at = state.get("paused_at") or row.current_node or "verification"
+        start_at = 0
+        for idx, node in enumerate(PIPELINE):
+            if node.name == paused_at:
+                start_at = idx + 1
+                break
+
+        state.pop("paused_at", None)
+        state.pop("pause_reason", None)
+        state["awaiting_human_review"] = False
+        self._checkpoint(
+            "pipeline.resume",
+            {"open_conflicts": 0, "resumed_from": paused_at,
+             "awaiting_human_review": False},
+            status="running",
+        )
+        log.info("workflow %s resumed after %s", self.ctx.workflow_id, paused_at)
+        return self._execute(state, start_at=start_at, weights=weights)
+
+    def _checkpoint(self, node: str, patch: dict, status: str = "running",
+                    paused_reason: str = "") -> None:
+        """Orchestrator entry — goes through ``run()`` so telemetry is recorded."""
+        self.supervisor.run(
+            self.ctx,
+            node=node,
+            patch=patch,
+            status=status,
+            paused_reason=paused_reason,
+        )
+
+    def _execute(self, state: dict, start_at: int = 0,
+                 weights: dict | None = None) -> dict:
+        lead_ids = list(state.get("lead_ids") or [])
+
+        for node in PIPELINE[start_at:]:
             if node.gate and not node.gate(state):
                 log.info("node %s skipped by gate", node.name)
-                self.supervisor.checkpoint(self.ctx, f"{node.name}.skipped", {},
-                                           status="running")
+                self._checkpoint(f"{node.name}.skipped", {}, status="running")
                 continue
 
             leads = self._leads(lead_ids)
@@ -85,8 +158,14 @@ class LeadPipeline:
                 state["open_conflicts"] = result.output.get("open_conflicts", 0)
 
             paused = bool(node.pauses_when and node.pauses_when(state))
-            self.supervisor.checkpoint(
-                self.ctx, node.name, {node.name: result.output},
+            patch = {node.name: result.output}
+            if node.agent_key == "verification":
+                patch["open_conflicts"] = state.get("open_conflicts", 0)
+            if paused:
+                patch["paused_at"] = node.name
+                patch["awaiting_human_review"] = True
+            self._checkpoint(
+                node.name, patch,
                 status="paused" if paused else "running",
                 paused_reason=result.pause_reason if paused else "",
             )
@@ -94,11 +173,31 @@ class LeadPipeline:
                 log.info("workflow %s paused at %s", self.ctx.workflow_id, node.name)
                 state["paused_at"] = node.name
                 state["pause_reason"] = result.pause_reason
+                state["status"] = "paused"
+                state["awaiting_human_review"] = True
                 return state
 
-        self.supervisor.checkpoint(self.ctx, "pipeline.complete", {},
-                                   status="completed")
+        self._checkpoint("pipeline.complete", {"awaiting_human_review": False},
+                         status="completed")
+        state["status"] = "completed"
+        state["awaiting_human_review"] = False
         return state
+
+    def _count_open_conflicts(self, lead_ids: list[str]) -> int:
+        from app.models import LeadVerification
+
+        if not lead_ids:
+            return 0
+        return (
+            self.ctx.db.query(LeadVerification)
+            .filter(
+                LeadVerification.tenant_id == self.ctx.tenant_id,
+                LeadVerification.lead_id.in_(lead_ids),
+                LeadVerification.status != "MATCH",
+                LeadVerification.resolved_value == "",
+            )
+            .count()
+        )
 
     def _leads(self, lead_ids: list[str]) -> list[Lead]:
         return (self.ctx.db.query(Lead)

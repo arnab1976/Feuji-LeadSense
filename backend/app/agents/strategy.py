@@ -15,7 +15,13 @@ SYSTEM = (
 class CampaignStrategyAgent(BaseAgent):
     key = "strategy"
     name = "Campaign Strategy"
-    role = "Converts a sales objective into a campaign plan"
+    summary = "Plans outreach sequences from approved knowledge"
+    definition = (
+        "Planning agent that proposes channel, cadence and messaging angles "
+        "grounded in tenant knowledge and segment context."
+    )
+    role = "Sequence design · channel mix · messaging angles"
+    stage = "7. Campaign strategy"
     inputs = "Product or offering, target market, segment, sales objective, approved knowledge"
     execution_strategy = (
         "Retrieve relevant product knowledge; identify the audience, pain and "
@@ -23,6 +29,7 @@ class CampaignStrategyAgent(BaseAgent):
     )
     outputs = "Campaign brief, target roles, sequence plan, messaging themes"
     stack = "LangGraph, LLM, RAG, pgvector, product knowledge base"
+    version = "strategy-v1"
 
     def execute(self, ctx: AgentContext, **kwargs) -> AgentResult:
         campaign: Campaign = kwargs["campaign"]

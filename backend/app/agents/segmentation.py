@@ -8,7 +8,13 @@ from app.models import Lead, LeadEnrichment, LeadScore, Segment, SegmentMember
 class SegmentationAgent(BaseAgent):
     key = "segmentation"
     name = "Segmentation"
-    role = "Groups leads into actionable audiences"
+    summary = "Slices scored leads into campaign audiences"
+    definition = (
+        "Audience agent that groups scored leads into segments for strategy "
+        "and outreach planning."
+    )
+    role = "Audience slicing · segment labels · campaign queues"
+    stage = "6. Segmentation"
     inputs = "Lead features, embeddings, campaign objective, tenant segmentation rules"
     execution_strategy = (
         "Apply deterministic filters; optionally cluster similar leads; label the "
@@ -16,6 +22,7 @@ class SegmentationAgent(BaseAgent):
     )
     outputs = "Segment assignment, confidence, segment explanation"
     stack = "Rules, embeddings, scikit-learn or HDBSCAN optional, LLM labelling"
+    version = "segmentation-v1"
 
     def execute(self, ctx: AgentContext, **kwargs) -> AgentResult:
         min_score: int = kwargs.get("min_score", 70)

@@ -4,7 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.agents import catalog
-from app.core.deps import CurrentUser, get_current_user, get_db
+from app.core.deps import CurrentUser, get_current_user, get_db, require_permission
 from app.core.errors import NotFound
 from app.models import AgentDecision, AgentExecution, AuditLog, WorkflowState
 
@@ -40,6 +40,7 @@ def executions(workflow_id: str | None = None, agent: str | None = None,
 
 @router.get("/decisions")
 def decisions(workflow_id: str | None = None, entity_id: str | None = None,
+              agent: str | None = None,
               limit: int = Query(default=100, le=500),
               db: Session = Depends(get_db),
               user: CurrentUser = Depends(get_current_user)):
@@ -50,6 +51,8 @@ def decisions(workflow_id: str | None = None, entity_id: str | None = None,
         stmt = stmt.where(AgentDecision.workflow_id == workflow_id)
     if entity_id:
         stmt = stmt.where(AgentDecision.entity_id == entity_id)
+    if agent:
+        stmt = stmt.where(AgentDecision.agent == agent)
     rows = db.scalars(stmt.limit(limit)).all()
     return [{"id": r.id, "workflow_id": r.workflow_id, "agent": r.agent,
              "decision": r.decision, "confidence": r.confidence, "reason": r.reason,
@@ -83,6 +86,33 @@ def workflow_detail(workflow_id: str, db: Session = Depends(get_db),
     return {"workflow_id": row.workflow_id, "status": row.status,
             "current_node": row.current_node, "paused_reason": row.paused_reason,
             "state": row.state, "history": row.history}
+
+
+@router.post("/workflows/{workflow_id}/resume")
+def resume_workflow(workflow_id: str, db: Session = Depends(get_db),
+                    user: CurrentUser = Depends(require_permission("lead:write"))):
+    """Resume a paused workflow after the verification human gate clears."""
+    from app.orchestration.graph import LeadPipeline
+
+    row = db.scalar(select(WorkflowState).where(
+        WorkflowState.workflow_id == workflow_id,
+        WorkflowState.tenant_id == user.tenant_id))
+    if not row:
+        raise NotFound("Workflow not found")
+
+    state = LeadPipeline(
+        db, user.tenant_id, workflow_id, user.id, user.name
+    ).resume()
+    db.commit()
+    return {
+        "workflow_id": workflow_id,
+        "status": state.get("status"),
+        "paused_at": state.get("paused_at"),
+        "open_conflicts": state.get("open_conflicts", 0),
+        "current_node": state.get("paused_at") or (
+            "pipeline.complete" if state.get("status") == "completed" else row.current_node
+        ),
+    }
 
 
 @router.get("/audit")

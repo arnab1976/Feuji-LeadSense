@@ -17,6 +17,7 @@ COMPARED_FIELDS = [
     ("title", "title", 0.86, 0.62),
     ("company_name", "company_name", 0.90, 0.70),
     ("location", "location", 0.80, 0.55),
+    ("email", "email", 0.99, 0.85),
 ]
 
 #: Words that carry no meaning when comparing two renderings of the same title.
@@ -42,7 +43,18 @@ def _strip_entity(name: str) -> str:
 class VerificationAgent(BaseAgent):
     key = "verification"
     name = "Verification"
-    role = "Reconciles uploaded versus extracted values"
+    summary = "Compares extracted fields and pauses for human review"
+    definition = (
+        "Human-in-the-loop gate that matches extracted values to source evidence "
+        "and opens conflicts when fields disagree."
+    )
+    description = (
+        "Pauses the pipeline when confidence or source match fails. Reviewers "
+        "resolve conflicts in the workbench; once clear, the Orchestrator resumes "
+        "Enrichment and Scoring."
+    )
+    role = "Conflict detection · human gate · approved field write-back"
+    stage = "3. Verification"
     inputs = "Uploaded lead fields, extracted fields, tenant thresholds"
     execution_strategy = (
         "Exact and rule comparison; fuzzy matching; semantic comparison where "
@@ -50,6 +62,7 @@ class VerificationAgent(BaseAgent):
     )
     outputs = "MATCH / MISMATCH / NEEDS_REVIEW, confidence, field-level reasons"
     stack = "Rule engine, RapidFuzz, embeddings for ambiguous cases, FastAPI"
+    version = "verification-v1"
 
     def execute(self, ctx: AgentContext, **kwargs) -> AgentResult:
         leads: list[Lead] = kwargs["leads"]

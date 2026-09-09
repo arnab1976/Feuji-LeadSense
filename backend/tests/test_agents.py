@@ -72,3 +72,10 @@ def test_agent_catalog_has_thirteen_entries():
     assert len(entries) == 13
     for entry in entries:
         assert entry["role"] and entry["execution_strategy"] and entry["stack"]
+    orchestrator = next(e for e in entries if e["key"] == "supervisor")
+    assert orchestrator["kind"] == "orchestrator"
+    assert orchestrator["number"] == 0
+    assert orchestrator["name"] == "Workflow Orchestrator"
+    ingestion = next(e for e in entries if e["key"] == "ingestion")
+    assert ingestion["number"] == 1
+    assert ingestion["kind"] == "agent"

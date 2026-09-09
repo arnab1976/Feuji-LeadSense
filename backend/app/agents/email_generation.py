@@ -16,15 +16,22 @@ SYSTEM = (
 class EmailGenerationAgent(BaseAgent):
     key = "email"
     name = "AI Email Generation"
-    role = "Produces grounded, personalised outreach"
+    summary = "Drafts compliant outreach copy for human review"
+    definition = (
+        "Generation agent that drafts personalised email variants from the "
+        "campaign plan and compliance constraints."
+    )
+    role = "Copy drafting · personalisation · compliance check"
+    stage = "8. AI email studio"
     inputs = ("Lead and company profile, campaign strategy, product knowledge, "
               "prior interactions, tone")
     execution_strategy = (
         "Retrieve approved context; generate subject, body, call to action and "
-        "follow-up variants; enforce structured output; attach provenance metadata."
+        "follow-ups; enforce structured output; attach provenance metadata."
     )
     outputs = "Subject variants, email body, CTA, follow-up content, generation metadata"
     stack = "LLM gateway, RAG, pgvector, prompt templates, Pydantic"
+    version = "email-v1"
 
     def execute(self, ctx: AgentContext, **kwargs) -> AgentResult:
         campaign: Campaign = kwargs["campaign"]

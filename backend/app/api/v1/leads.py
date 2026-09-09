@@ -179,10 +179,18 @@ def resolve_conflict(body: ConflictResolution, db: Session = Depends(get_db),
     row.resolved_by = user.name or user.email
     row.resolved_at = datetime.now(timezone.utc)
 
+    from app.orchestration.graph import LeadPipeline
     from app.services.telemetry import record_decision
 
+    lead = db.get(Lead, row.lead_id)
+    workflow_id = (lead.workflow_id if lead and lead.workflow_id else row.lead_id)
+
+    # Apply the trusted value onto the lead so list/detail views stay in sync.
+    if lead and row.field in ("title", "company_name", "location", "email", "phone"):
+        setattr(lead, row.field, value or "")
+
     record_decision(
-        db, tenant_id=user.tenant_id, workflow_id=row.lead_id,
+        db, tenant_id=user.tenant_id, workflow_id=workflow_id,
         agent="verification", decision=body.resolution.upper(), confidence=1.0,
         reason=f"Human resolution by {row.resolved_by}", entity_type="lead",
         entity_id=row.lead_id, version="verify-v1", human_override=True,
@@ -190,23 +198,36 @@ def resolve_conflict(body: ConflictResolution, db: Session = Depends(get_db),
     db.add(AuditLog(tenant_id=user.tenant_id, actor_id=user.id, actor_name=user.name,
                     action="verification.resolve", entity_type="lead_verification",
                     entity_id=row.id,
-                    payload={"resolution": body.resolution, "value": value}))
+                    payload={"resolution": body.resolution, "value": value,
+                             "workflow_id": workflow_id}))
 
     remaining = (db.query(LeadVerification)
                  .filter(LeadVerification.lead_id == row.lead_id,
                          LeadVerification.status != "MATCH",
                          LeadVerification.resolved_value == "").count())
-    lead = db.get(Lead, row.lead_id)
+    pipeline_state: dict = {}
     if lead and remaining == 0:
         lead.status = "verified"
+        if lead.workflow_id:
+            pipeline_state = LeadPipeline(
+                db, user.tenant_id, lead.workflow_id, user.id, user.name
+            ).resume()
     db.commit()
-    return {"message": "Conflict resolved", "lead_id": row.lead_id,
-            "remaining_conflicts": remaining}
+    return {
+        "message": "Conflict resolved",
+        "lead_id": row.lead_id,
+        "remaining_conflicts": remaining,
+        "workflow_id": workflow_id,
+        "pipeline_status": pipeline_state.get("status"),
+        "open_conflicts": pipeline_state.get("open_conflicts"),
+    }
 
 
 @router.post("/verification/bulk-resolve")
 def bulk_resolve(body: BulkResolution, db: Session = Depends(get_db),
                  user: CurrentUser = Depends(require_permission("lead:write"))):
+    from app.orchestration.graph import LeadPipeline
+
     stmt = (db.query(LeadVerification)
             .filter(LeadVerification.tenant_id == user.tenant_id,
                     LeadVerification.status != "MATCH",
@@ -215,35 +236,72 @@ def bulk_resolve(body: BulkResolution, db: Session = Depends(get_db),
         stmt = stmt.filter(LeadVerification.lead_id.in_(body.lead_ids))
     rows = stmt.all()
     for row in rows:
-        row.resolved_value = (row.extracted_value if body.resolution == "extracted"
-                              else row.uploaded_value)
+        value = (row.extracted_value if body.resolution == "extracted"
+                 else row.uploaded_value)
+        row.resolved_value = value
         row.resolved_source = body.resolution
         row.resolved_by = user.name or user.email
         row.resolved_at = datetime.now(timezone.utc)
+        lead = db.get(Lead, row.lead_id)
+        if lead and row.field in ("title", "company_name", "location", "email", "phone"):
+            setattr(lead, row.field, value or "")
 
     touched = {r.lead_id for r in rows}
+    workflow_ids: set[str] = set()
     for lead_id in touched:
         lead = db.get(Lead, lead_id)
         if lead:
             lead.status = "verified"
+            if lead.workflow_id:
+                workflow_ids.add(lead.workflow_id)
+
+    resumed = []
+    for workflow_id in workflow_ids:
+        state = LeadPipeline(
+            db, user.tenant_id, workflow_id, user.id, user.name
+        ).resume()
+        resumed.append({"workflow_id": workflow_id, "status": state.get("status")})
+
     db.add(AuditLog(tenant_id=user.tenant_id, actor_id=user.id, actor_name=user.name,
                     action="verification.bulk_resolve", entity_type="lead",
-                    payload={"resolved": len(rows), "resolution": body.resolution}))
+                    payload={"resolved": len(rows), "resolution": body.resolution,
+                             "workflows_resumed": [r["workflow_id"] for r in resumed]}))
     db.commit()
-    return {"resolved": len(rows), "leads_cleared": len(touched)}
+    return {
+        "resolved": len(rows),
+        "leads_cleared": len(touched),
+        "workflows_resumed": resumed,
+    }
 
 
 # -- pipeline steps --------------------------------------------------------
 @router.post("/enrich")
 def enrich(body: ScoreRequest, db: Session = Depends(get_db),
            user: CurrentUser = Depends(require_permission("lead:write"))):
+    from app.models import LeadVerification
+
     leads = _resolve_leads(db, user, body.lead_ids, default_status="verified")
+    # Hard gate: do not enrich while open conflicts remain.
+    blocked_ids = {
+        lead.id for lead in leads
+        if db.query(LeadVerification).filter(
+            LeadVerification.lead_id == lead.id,
+            LeadVerification.status != "MATCH",
+            LeadVerification.resolved_value == "",
+        ).count()
+    }
+    leads = [lead for lead in leads if lead.id not in blocked_ids]
+    if not leads:
+        return {"enriched": 0, "skipped": len(blocked_ids),
+                "message": "No verified leads without open conflicts"}
     ctx = AgentContext(db=db, tenant_id=user.tenant_id,
                        workflow_id=new_workflow_id(), user_id=user.id,
                        user_name=user.name)
     result = get_agent("enrichment").run(ctx, leads=leads)
     db.commit()
-    return result.output
+    out = dict(result.output)
+    out["skipped_open_conflicts"] = len(blocked_ids)
+    return out
 
 
 @router.post("/score")
@@ -252,7 +310,9 @@ def score(body: ScoreRequest, db: Session = Depends(get_db),
     """Re-score with custom weights. Weights are not persisted unless you PUT the
     tenant policy — that keeps the 'move a slider in the demo' path side-effect
     free."""
-    leads = _resolve_leads(db, user, body.lead_ids)
+    leads = _resolve_leads(db, user, body.lead_ids, default_status="enriched")
+    if not leads:
+        leads = _resolve_leads(db, user, body.lead_ids, default_status="scored")
     ctx = AgentContext(db=db, tenant_id=user.tenant_id,
                        workflow_id=new_workflow_id(), user_id=user.id,
                        user_name=user.name)

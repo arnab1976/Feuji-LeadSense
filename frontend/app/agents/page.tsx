@@ -33,8 +33,8 @@ function Agents() {
       <div className="page-head">
         <h1>Agents</h1>
         <p>
-          Thirteen agents, each with a declared role, execution strategy and output.
-          Every run and every decision is recorded, which is what makes an agent
+          One Workflow Orchestrator (pipeline control) plus numbered lead agents.
+          Every run and every decision is recorded, which is what makes each step
           answerable after the fact.
         </p>
       </div>
@@ -42,9 +42,47 @@ function Agents() {
       <Notice kind="error">{error}</Notice>
 
       <div className="card">
+        <h2>Pipeline control</h2>
+        <div className="grid cols-3">
+          {catalog
+            .filter((agent) => agent.kind === "orchestrator" || agent.key === "supervisor")
+            .map((agent) => (
+              <div
+                key={agent.key}
+                className="stat"
+                style={{ cursor: "pointer", borderColor: "var(--violet-line, #c9c0e8)" }}
+                onClick={() => setOpen(open === agent.key ? null : agent.key)}
+              >
+                <div className="label">System · Orchestrator</div>
+                <div style={{ fontWeight: 700, marginTop: 2 }}>{agent.name}</div>
+                <div className="small muted" style={{ marginTop: 4 }}>
+                  {agent.role}
+                </div>
+                {open === agent.key && (
+                  <div className="small" style={{ marginTop: 10 }}>
+                    <p>
+                      <strong>Inputs:</strong> {agent.inputs}
+                    </p>
+                    <p>
+                      <strong>Strategy:</strong> {agent.execution_strategy}
+                    </p>
+                    <p>
+                      <strong>Outputs:</strong> {agent.outputs}
+                    </p>
+                    <p className="muted mono">{agent.stack}</p>
+                  </div>
+                )}
+              </div>
+            ))}
+        </div>
+      </div>
+
+      <div className="card">
         <h2>Agent catalog</h2>
         <div className="grid cols-3">
-          {catalog.map((agent) => (
+          {catalog
+            .filter((agent) => agent.kind !== "orchestrator" && agent.key !== "supervisor")
+            .map((agent) => (
             <div
               key={agent.key}
               className="stat"
