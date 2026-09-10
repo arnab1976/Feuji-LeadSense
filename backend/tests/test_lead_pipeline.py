@@ -1,11 +1,9 @@
 """LeadPipeline: extract → verify pause → resolve → resume → enrich → score."""
 from __future__ import annotations
 
-import io
-import json
-
 from app.agents import AgentContext, get_agent
-from app.connectors.demo_data import demo_leads
+from app.agents.extraction import ExtractionAgent
+from app.connectors.base import RawLead
 from app.db.session import SessionLocal
 from app.models import (
     IngestJob, Lead, LeadEnrichment, LeadScore, LeadVerification, Tenant,
@@ -15,7 +13,56 @@ from app.orchestration.graph import LeadPipeline
 from app.orchestration.state import new_workflow_id
 
 
-def test_pipeline_pauses_on_conflicts_then_resumes_to_scoring():
+def _sample_leads() -> list[RawLead]:
+    return [
+        RawLead(
+            external_id="pipeline-0",
+            full_name="Pipeline Case Zero",
+            email="pipeline.case0@example.test",
+            title="VP Operations",
+            company_name="Northbridge Bank",
+            location="Mumbai",
+            industry="Banking",
+            source="pipeline_test",
+        ),
+        RawLead(
+            external_id="pipeline-1",
+            full_name="Pipeline Case One",
+            email="pipeline.case1@example.test",
+            title="CTO",
+            company_name="Aurum Capital",
+            location="Singapore",
+            industry="Asset management",
+            source="pipeline_test",
+        ),
+        RawLead(
+            external_id="pipeline-2",
+            full_name="Pipeline Case Two",
+            email="pipeline.case2@example.test",
+            title="Head of Claims Technology",
+            company_name="Vantage Insurance",
+            location="London",
+            industry="Insurance",
+            source="pipeline_test",
+        ),
+    ]
+
+
+def test_pipeline_pauses_on_conflicts_then_resumes_to_scoring(monkeypatch):
+    """Human-gate path: inject field mismatches (demo_data is deactivated)."""
+    real_extract = ExtractionAgent._extract
+
+    def mismatched_extract(lead):
+        payload = real_extract(lead)
+        # Material differences so Verification opens conflicts.
+        if payload.get("title"):
+            payload["title"] = f"Expanded {payload['title']}"
+        if payload.get("company_name"):
+            payload["company_name"] = f"{payload['company_name']} Holdings Plc"
+        return payload
+
+    monkeypatch.setattr(ExtractionAgent, "_extract", staticmethod(mismatched_extract))
+
     db = SessionLocal()
     try:
         tenant = db.query(Tenant).filter(Tenant.slug == "feuji-revops").first()
@@ -31,12 +78,7 @@ def test_pipeline_pauses_on_conflicts_then_resumes_to_scoring():
             db=db, tenant_id=tenant.id, workflow_id=workflow_id,
             user_id="test", user_name="Test",
         )
-        # People with deliberate title/company mismatches vs canonical_profile.
-        raw = demo_leads("pipeline_test", limit=3)
-        # Use unique emails so seed duplicates do not collapse the batch.
-        for idx, lead in enumerate(raw):
-            lead.email = f"pipeline.case{idx}@example.test"
-            lead.external_id = f"pipeline-{idx}"
+        raw = _sample_leads()
 
         ingested = get_agent("ingestion").run(
             ctx, raw_leads=raw, job=job, connector_key="manual_upload",
@@ -124,20 +166,14 @@ def test_pipeline_pauses_on_conflicts_then_resumes_to_scoring():
         db.close()
 
 
-def test_upload_fixture_csv_pauses_for_human_review(client, auth):
-    from pathlib import Path
-
-    csv_path = Path(__file__).resolve().parents[1] / "fixtures" / "demo" / "saas_platform_targets.csv"
-    content = csv_path.read_bytes()
-    files = {"file": ("saas_platform_targets.csv", io.BytesIO(content), "text/csv")}
+def test_upload_fixture_csv_pauses_for_canonical_mismatches(client, auth):
+    """BFSI fixture → canonical_profile → open verification conflicts."""
     resp = client.post(
-        "/api/v1/sources/upload",
-        files=files,
-        data={"mapping_json": json.dumps({}), "run_pipeline": "true"},
+        "/api/v1/sources/fixtures/run"
+        "?filename=salesforce_bfsi_prospect_list.csv&limit=10&run_pipeline=true&connector_key=salesforce",
         headers=auth,
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["rows_valid"] >= 1
-    # Demo people have title mismatches → pipeline should pause.
     assert body.get("open_conflicts", 0) > 0 or body.get("paused_at") == "verification"

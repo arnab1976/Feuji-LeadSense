@@ -65,6 +65,49 @@ def test_verification_ignores_legal_suffixes():
     assert status == "MATCH"
 
 
+def test_extraction_applies_company_canonical_profile():
+    """BFSI fixture companies get canonical expansions for Verification mismatches."""
+    from types import SimpleNamespace
+
+    from app.agents.extraction import ExtractionAgent
+
+    lead = SimpleNamespace(
+        full_name="Aarav Mehta",
+        title="VP Operations",
+        company_name="Northbridge Bank",
+        location="Mumbai",
+        email="aarav.mehta1@northbridgebank.com",
+        phone="",
+        connector_key="salesforce",
+        raw_payload={"demo": True, "industry": "BFSI"},
+    )
+    payload = ExtractionAgent._extract(lead)
+    assert payload["canonical_applied"] is True
+    assert payload["title"] == "Vice President - Banking Operations"
+    assert payload["company_name"] == "Northbridge Bank Ltd"
+
+
+def test_extraction_unknown_company_stays_same_source():
+    from types import SimpleNamespace
+
+    from app.agents.extraction import ExtractionAgent
+
+    lead = SimpleNamespace(
+        full_name="Someone Else",
+        title="Analyst",
+        company_name="Acme Widgets LLC",
+        location="NYC",
+        email="someone@acme.example",
+        phone="",
+        connector_key="salesforce",
+        raw_payload={},
+    )
+    payload = ExtractionAgent._extract(lead)
+    assert payload["canonical_applied"] is False
+    assert payload["title"] == "Analyst"
+    assert payload["company_name"] == "Acme Widgets LLC"
+
+
 def test_agent_catalog_has_thirteen_entries():
     from app.agents import catalog
 

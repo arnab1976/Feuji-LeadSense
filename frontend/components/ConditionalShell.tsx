@@ -13,7 +13,10 @@ export default function ConditionalShell({
   children: React.ReactNode;
 }) {
   const pathname = usePathname();
-  const bare = pathname === "/" || pathname.startsWith("/workflow");
+  const bare =
+    pathname === "/" ||
+    pathname.startsWith("/workflow") ||
+    pathname.startsWith("/verification");
 
   if (bare) return <>{children}</>;
 

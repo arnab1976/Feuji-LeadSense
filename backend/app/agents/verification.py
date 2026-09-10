@@ -43,25 +43,39 @@ def _strip_entity(name: str) -> str:
 class VerificationAgent(BaseAgent):
     key = "verification"
     name = "Verification"
-    summary = "Compares extracted fields and pauses for human review"
+    summary = "Human gate that reconciles uploaded vs extracted fields"
     definition = (
-        "Human-in-the-loop gate that matches extracted values to source evidence "
-        "and opens conflicts when fields disagree."
+        "Data-integrity specialist that compares Agent 01 uploaded values with "
+        "auto-extracted canonical profiles, classifies each field, and pauses "
+        "the pipeline until a reviewer chooses the trusted value."
     )
     description = (
-        "Pauses the pipeline when confidence or source match fails. Reviewers "
-        "resolve conflicts in the workbench; once clear, the Orchestrator resumes "
-        "Enrichment and Scoring."
+        "Runs after Ingestion (and automatic Extraction). For each compared field "
+        "(title, company, location, email) it scores similarity with exact rules, "
+        "fuzzy matching, then embeddings. MATCH rows auto-accept the extracted "
+        "value; MISMATCH and NEEDS_REVIEW open the Verification bench for a human "
+        "to pick Uploaded or Extracted. When the queue for a workflow is clear, "
+        "the Orchestrator resumes Enrichment and Scoring on the same lead set."
     )
-    role = "Conflict detection · human gate · approved field write-back"
-    stage = "3. Verification"
-    inputs = "Uploaded lead fields, extracted fields, tenant thresholds"
+    role = "Data integrity · conflict detection · human gate · trusted write-back"
+    stage = "2. Verification"
+    inputs = (
+        "Leads and LeadExtraction rows from the prior Agent 01 workflow "
+        "(uploaded fields + extracted payload), tenant match/review thresholds"
+    )
     execution_strategy = (
-        "Exact and rule comparison; fuzzy matching; semantic comparison where "
-        "needed; classify; compute confidence; route mismatch and review cases."
+        "1) Load extracted snapshot per lead from the active workflow. "
+        "2) Compare each field cheapest-first: exact/normalized rule → RapidFuzz → "
+        "embedding cosine. "
+        "3) Classify MATCH / NEEDS_REVIEW / MISMATCH with confidence + reason. "
+        "4) Auto-resolve MATCH; queue the rest for the Verification bench. "
+        "5) Pause Orchestrator while open conflicts remain; resume when cleared."
     )
-    outputs = "MATCH / MISMATCH / NEEDS_REVIEW, confidence, field-level reasons"
-    stack = "Rule engine, RapidFuzz, embeddings for ambiguous cases, FastAPI"
+    outputs = (
+        "Field-level LeadVerification rows, open_conflicts count, "
+        "MATCH / MISMATCH / NEEDS_REVIEW tallies, pause signal for human review"
+    )
+    stack = "Rule engine, RapidFuzz, embeddings, FastAPI workbench"
     version = "verification-v1"
 
     def execute(self, ctx: AgentContext, **kwargs) -> AgentResult:

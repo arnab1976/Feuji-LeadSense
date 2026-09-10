@@ -8,7 +8,7 @@ from __future__ import annotations
 from sqlalchemy import select
 
 from app.agents import AgentContext, get_agent
-from app.connectors.demo_data import demo_leads
+from app.connectors.demo_data import DEMO_DATA_ACTIVE, demo_leads
 from app.core.logging import get_logger
 from app.db.init_db import init_db
 from app.db.session import SessionLocal
@@ -141,6 +141,10 @@ def seed() -> None:
 
 def _seed_leads(db, tenant_id: str, connections: dict) -> None:
     """Load leads from two different sources so the source layer is visible."""
+    if not DEMO_DATA_ACTIVE:
+        log.info("demo_data deactivated — skipping synthetic lead seed")
+        return
+
     # Distinct slices per source, so the demo shows leads arriving from two
     # different systems rather than one system and six duplicates.
     for key, count, offset in (("salesforce", 6, 0), ("hubspot", 6, 6)):
@@ -153,6 +157,9 @@ def _seed_leads(db, tenant_id: str, connections: dict) -> None:
         db.flush()
 
         raw = demo_leads(key, count, offset=offset)
+        if not raw:
+            log.info("no demo leads for %s — skip", key)
+            continue
         ctx = AgentContext(db=db, tenant_id=tenant_id, workflow_id=workflow_id,
                            user_name="Seed")
         result = get_agent("ingestion").run(

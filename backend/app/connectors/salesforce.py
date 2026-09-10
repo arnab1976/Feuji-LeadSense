@@ -4,9 +4,8 @@ Reads Leads and Contacts through the REST API and writes activity back, so a
 qualified LeadSense record and its reply intent land on the record the sales team
 actually works from.
 
-Auth: OAuth 2.0 username-password flow by default (simple for demos). For
-production, swap ``_authenticate`` for the JWT bearer flow with a connected app
-certificate — the rest of the class is unchanged.
+Auth: OAuth 2.0 **client credentials** (External Client Apps) by default.
+Falls back to the legacy username-password flow when username/password are set.
 """
 from __future__ import annotations
 
@@ -31,11 +30,19 @@ class SalesforceConnector(SourceConnector):
     capabilities = {Capability.FETCH, Capability.PUSH, Capability.INCREMENTAL, Capability.SEARCH}
     config_fields = [
         ConfigField("domain", "My Domain", "text", required=True,
-                    help="e.g. acme.my.salesforce.com"),
+                    help="e.g. yourorg-dev-ed.my.salesforce.com (no https://)"),
         ConfigField("client_id", "Consumer key", "password", required=True, secret=True),
         ConfigField("client_secret", "Consumer secret", "password", required=True, secret=True),
-        ConfigField("username", "Username", "text", required=True),
-        ConfigField("password", "Password + security token", "password", required=True, secret=True),
+        ConfigField(
+            "username", "Username (legacy only)", "text", required=False,
+            help="Only needed for old Connected Apps using password flow. "
+                 "Leave blank for External Client Apps (client credentials).",
+        ),
+        ConfigField(
+            "password", "Password + security token (legacy only)", "password",
+            required=False, secret=True,
+            help="Only for legacy password flow. Leave blank for External Client Apps.",
+        ),
         ConfigField("object", "Object", "select", options=["Lead", "Contact"], default="Lead"),
         ConfigField("soql_filter", "Extra SOQL filter", "text",
                     help="Optional WHERE clause fragment, e.g. Status = 'Open'"),
@@ -46,18 +53,39 @@ class SalesforceConnector(SourceConnector):
         return bool(
             (self.config.get("domain") or settings.salesforce_domain)
             and (self.config.get("client_id") or settings.salesforce_client_id)
+            and (self.config.get("client_secret") or settings.salesforce_client_secret)
+        )
+
+    def _use_password_flow(self) -> bool:
+        return bool(
+            (self.config.get("username") or settings.salesforce_username)
+            and (self.config.get("password") or settings.salesforce_password)
         )
 
     # -- auth ------------------------------------------------------------
     def _authenticate(self) -> tuple[str, str]:
-        domain = self.setting("domain", "salesforce_domain")
-        payload = {
-            "grant_type": "password",
-            "client_id": self.setting("client_id", "salesforce_client_id"),
-            "client_secret": self.setting("client_secret", "salesforce_client_secret"),
-            "username": self.setting("username", "salesforce_username"),
-            "password": self.setting("password", "salesforce_password"),
-        }
+        domain = str(self.setting("domain", "salesforce_domain") or "").strip()
+        domain = domain.removeprefix("https://").removeprefix("http://").rstrip("/")
+        if not domain:
+            raise ConnectorError("Salesforce My Domain is required")
+
+        client_id = self.setting("client_id", "salesforce_client_id")
+        client_secret = self.setting("client_secret", "salesforce_client_secret")
+        if self._use_password_flow():
+            payload = {
+                "grant_type": "password",
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "username": self.setting("username", "salesforce_username"),
+                "password": self.setting("password", "salesforce_password"),
+            }
+        else:
+            payload = {
+                "grant_type": "client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+            }
+
         url = f"https://{domain}/services/oauth2/token"
         with httpx.Client(timeout=30) as client:
             resp = client.post(url, data=payload)
@@ -72,8 +100,12 @@ class SalesforceConnector(SourceConnector):
                     "details": {"demo": True}}
         try:
             token, instance = self._authenticate()
-            return {"ok": True, "message": "Authenticated",
-                    "details": {"instance_url": instance, "token_prefix": token[:6]}}
+            mode = "password" if self._use_password_flow() else "client_credentials"
+            return {
+                "ok": True,
+                "message": f"Authenticated ({mode})",
+                "details": {"instance_url": instance, "token_prefix": token[:6], "mode": mode},
+            }
         except Exception as exc:
             return {"ok": False, "message": str(exc), "details": {}}
 

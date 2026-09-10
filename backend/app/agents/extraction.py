@@ -1,10 +1,9 @@
 """Agent 03 - Extraction.
 
-Fetches the canonical view of a lead from its permitted source and stores it
-*alongside* the uploaded values rather than over them. Verification needs both.
-
-Normalises titles, company legal suffixes, and contact fields so Agent 04 can
-compare apples-to-apples.
+Persists a structured profile *alongside* the uploaded Lead so Verification can
+compare the two. Starts from the ingested fields; when a demo canonical profile
+is known for the company/title (fixture Verification demos), that becomes the
+extracted snapshot so MATCH / MISMATCH / NEEDS_REVIEW can surface.
 """
 from __future__ import annotations
 
@@ -48,17 +47,18 @@ class ExtractionAgent(BaseAgent):
         "profile with cleaned titles, companies, emails and phones."
     )
     description = (
-        "Runs after Ingestion. It standardises person and company fields, fills "
-        "structured contact attributes, and writes a canonical profile the "
-        "Verification gate can compare against the source of truth."
+        "Runs after Ingestion. Copies ingested person/company fields into "
+        "LeadExtraction with light contact normalisation. For known demo "
+        "fixture companies it applies canonical_profile expansions so the "
+        "Verification bench can show field conflicts."
     )
     role = "Field cleaning · entity normalisation · profile assembly"
     stage = "2. Extraction"
     inputs = "RawLead[], connector field map, source-policy configuration, tenant context"
     execution_strategy = (
-        "Check source policy; fetch the approved source; parse; normalise titles, "
-        "companies and contact fields; persist the extracted snapshot alongside "
-        "the upload for Verification."
+        "Check source policy; build extracted snapshot from the ingested lead; "
+        "apply demo canonical_profile when the company/title is known; "
+        "normalise contact fields; persist alongside the upload for Verification."
     )
     outputs = (
         "Structured profile (title, company, location, email, phone), "
@@ -122,20 +122,20 @@ class ExtractionAgent(BaseAgent):
 
     @staticmethod
     def _extract(lead: Lead) -> dict:
-        """Return the canonical profile for a lead.
-
-        Demo people resolve via ``canonical_profile`` (deliberate title/company
-        mismatches for Verification). Unknown leads fall back to the upload with
-        normalised contact fields.
-        """
+        """Build extracted snapshot; apply demo canonical_profile when known."""
         raw = lead.raw_payload or {}
-        canonical = canonical_profile(lead.full_name)
+        email = normalize_email(lead.email or raw.get("email", ""))
+        phone = normalize_phone(lead.phone or raw.get("phone", ""))
+
+        canonical = canonical_profile(
+            lead.full_name or "",
+            title=lead.title or "",
+            company_name=lead.company_name or "",
+        )
         if canonical:
-            title = canonical.get("title") or lead.title
-            company = canonical.get("company_name") or lead.company_name
-            location = canonical.get("location") or lead.location
-            email = normalize_email(lead.email or raw.get("email", ""))
-            phone = normalize_phone(lead.phone or raw.get("phone", ""))
+            title = canonical.get("title") or lead.title or ""
+            company = canonical.get("company_name") or lead.company_name or ""
+            location = canonical.get("location") or lead.location or ""
             return {
                 "full_name": canonical.get("full_name") or lead.full_name,
                 "title": title,
@@ -143,11 +143,11 @@ class ExtractionAgent(BaseAgent):
                 "location": location,
                 "email": email,
                 "phone": phone,
-                "industry": canonical.get("industry", raw.get("industry", "")),
-                "employee_count": canonical.get(
-                    "employee_count", raw.get("employee_count", 0)
-                ),
-                "tech_stack": canonical.get("tech_stack", raw.get("tech_stack", [])),
+                "industry": canonical.get("industry") or raw.get("industry", ""),
+                "employee_count": canonical.get("employee_count")
+                or raw.get("employee_count", 0),
+                "tech_stack": canonical.get("tech_stack")
+                or raw.get("tech_stack", []),
                 "normalized": {
                     "title": normalize_title(title),
                     "company_name": normalize_company(company),
@@ -155,12 +155,11 @@ class ExtractionAgent(BaseAgent):
                     "phone": phone,
                 },
                 "source": lead.connector_key,
+                "canonical_applied": True,
             }
 
         title = lead.title or ""
         company = lead.company_name or ""
-        email = normalize_email(lead.email or raw.get("email", ""))
-        phone = normalize_phone(lead.phone or raw.get("phone", ""))
         return {
             "full_name": lead.full_name,
             "title": title,
@@ -178,4 +177,5 @@ class ExtractionAgent(BaseAgent):
                 "phone": phone,
             },
             "source": lead.connector_key,
+            "canonical_applied": False,
         }

@@ -17,7 +17,7 @@ from app.connectors.manual_upload import ManualUploadConnector
 from app.core.config import settings
 from app.core.deps import CurrentUser, get_current_user, get_db, require_permission
 from app.core.errors import NotFound, ValidationFailure
-from app.models import AuditLog, IngestJob, SourceConnection
+from app.models import AuditLog, IngestJob, Lead, SourceConnection
 from app.orchestration.graph import LeadPipeline
 from app.orchestration.state import new_workflow_id
 from app.schemas.source import (
@@ -516,16 +516,8 @@ def connect_and_import(
 
 
 # -- manual upload ---------------------------------------------------------
-@router.get("/fixtures/{filename}/preview")
-def preview_demo_fixture(
-    filename: str,
-    limit: int = 10,
-    user: CurrentUser = Depends(require_permission("lead:read")),
-):
-    """Return sample rows from a packaged demo fixture CSV (Agent 01 Display)."""
+def _demo_fixture_path(filename: str):
     from pathlib import Path
-    import csv
-    import io
 
     safe_name = Path(filename).name
     if safe_name != filename or not safe_name.lower().endswith((".csv", ".tsv")):
@@ -535,8 +527,22 @@ def preview_demo_fixture(
     path = (fixture_dir / safe_name).resolve()
     if not str(path).startswith(str(fixture_dir.resolve())) or not path.is_file():
         raise NotFound(f"Demo fixture '{safe_name}' not found")
+    return safe_name, path
 
-    sample_limit = max(1, min(int(limit or 10), 25))
+
+@router.get("/fixtures/{filename}/preview")
+def preview_demo_fixture(
+    filename: str,
+    limit: int = 10,
+    user: CurrentUser = Depends(require_permission("lead:read")),
+):
+    """Return sample rows from a packaged demo fixture CSV (Agent 01 Display)."""
+    import csv
+    import io
+
+    safe_name, path = _demo_fixture_path(filename)
+
+    sample_limit = max(1, min(int(limit or 10), 50))
     text = path.read_text(encoding="utf-8-sig")
     delimiter = "\t" if safe_name.lower().endswith(".tsv") else ","
     reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
@@ -557,6 +563,134 @@ def preview_demo_fixture(
         "rows_total": total,
         "sample_rows": rows,
         "sample_count": len(rows),
+    }
+
+
+@router.post("/fixtures/run")
+def run_demo_fixture(
+    filename: str,
+    limit: int = 50,
+    run_pipeline: bool = True,
+    connector_key: str = "manual_upload",
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(require_permission("lead:write")),
+):
+    """Ingest a packaged demo fixture and run extract → verify (canonical profiles).
+
+    Query: filename, limit, run_pipeline, connector_key.
+    Used when Agent 01 opens the Verification bench on a selected prospect list.
+    """
+    safe_name, path = _demo_fixture_path(filename)
+    content = path.read_bytes()
+    row_limit = max(1, min(int(limit or 50), 100))
+
+    connector = ManualUploadConnector(tenant_id=user.tenant_id)
+    leads, report = connector.parse(content, safe_name)
+    leads = leads[:row_limit]
+
+    source_key = (connector_key or "manual_upload").strip() or "manual_upload"
+    workflow_id = new_workflow_id()
+    # Namespace contacts per run so repeated "Open Verification bench" is not
+    # collapsed entirely by email dedupe against prior fixture imports.
+    run_tag = workflow_id.lower().replace("-", "")[-10:]
+    original_emails: list[str] = []
+    for lead in leads:
+        raw = dict(lead.raw or {})
+        raw["demo"] = True
+        raw["fixture"] = safe_name
+        raw["fixture_run"] = workflow_id
+        lead.raw = raw
+        if lead.email and "@" in lead.email:
+            original_emails.append(lead.email.strip().lower())
+            local, domain = lead.email.split("@", 1)
+            # Avoid + addressing — some validators / older rows treat it oddly.
+            lead.email = f"{local}.{run_tag}@{domain}"
+        if lead.external_id:
+            lead.external_id = f"{lead.external_id}-{run_tag}"
+
+    conn = db.scalar(
+        select(SourceConnection).where(
+            SourceConnection.tenant_id == user.tenant_id,
+            SourceConnection.connector_key == source_key,
+        )
+    )
+    # Prefer manual_upload connection when the named connector has none —
+    # fixture files are CSV, not a live CRM pull.
+    if conn is None and source_key != "manual_upload":
+        conn = db.scalar(
+            select(SourceConnection).where(
+                SourceConnection.tenant_id == user.tenant_id,
+                SourceConnection.connector_key == "manual_upload",
+            )
+        )
+        source_key = "manual_upload"
+
+    job = IngestJob(
+        tenant_id=user.tenant_id,
+        connector_key=source_key,
+        filename=safe_name,
+        storage_key="",
+        mapping=report.get("mapping") or {},
+        status="running",
+        source_connection_id=conn.id if conn else None,
+    )
+    db.add(job)
+    db.flush()
+
+    ctx = AgentContext(
+        db=db, tenant_id=user.tenant_id, workflow_id=workflow_id,
+        user_id=user.id, user_name=user.name,
+    )
+    result = get_agent("ingestion").run(
+        ctx, raw_leads=leads, job=job, connector_key=source_key,
+        connection_id=conn.id if conn else None,
+    )
+    _supervisor_after_ingestion(ctx, result.output)
+    job.rows_invalid += report.get("rows_invalid", 0)
+
+    lead_ids = list(result.output.get("lead_ids") or [])
+    # If everything deduped, reuse matching existing leads and re-verify them.
+    if not lead_ids and original_emails:
+        existing = (
+            db.query(Lead.id)
+            .filter(
+                Lead.tenant_id == user.tenant_id,
+                Lead.email.in_(original_emails),
+            )
+            .limit(row_limit)
+            .all()
+        )
+        lead_ids = [row[0] for row in existing]
+        for lead_id in lead_ids:
+            lead = db.get(Lead, lead_id)
+            if lead:
+                lead.workflow_id = workflow_id
+
+    pipeline_state: dict = {}
+    if run_pipeline and lead_ids:
+        pipeline_state = LeadPipeline(
+            db, user.tenant_id, workflow_id, user.id, user.name
+        ).run(lead_ids)
+
+    db.add(AuditLog(
+        tenant_id=user.tenant_id, actor_id=user.id, actor_name=user.name,
+        action="lead.fixture_run", entity_type="ingest_job", entity_id=job.id,
+        payload={"filename": safe_name, "rows": len(leads), "limit": row_limit},
+    ))
+    db.commit()
+
+    return {
+        "job_id": job.id,
+        "workflow_id": workflow_id,
+        "filename": safe_name,
+        "rows_read": report.get("rows_read", len(leads)),
+        "rows_valid": result.output["rows_valid"],
+        "rows_invalid": job.rows_invalid,
+        "rows_duplicate": result.output["rows_duplicate"],
+        "lead_ids": lead_ids,
+        "paused_at": pipeline_state.get("paused_at"),
+        "open_conflicts": pipeline_state.get("open_conflicts", 0),
+        "status": pipeline_state.get("status"),
     }
 
 

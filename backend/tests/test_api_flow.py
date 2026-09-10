@@ -116,9 +116,11 @@ def test_manual_upload_preview_and_ingest(client, auth):
 
 def test_verification_queue_and_resolution(client, auth):
     queue = client.get("/api/v1/leads/verification/queue", headers=auth).json()
-    assert isinstance(queue, list)
-    if queue:
-        first = queue[0]
+    assert isinstance(queue, dict)
+    assert "items" in queue and "stats" in queue
+    items = queue["items"]
+    if items:
+        first = items[0]
         assert first["status"] in ("MISMATCH", "NEEDS_REVIEW")
         resolved = client.post("/api/v1/leads/verification/resolve",
                                json={"verification_id": first["verification_id"],
@@ -129,7 +131,9 @@ def test_verification_queue_and_resolution(client, auth):
     bulk = client.post("/api/v1/leads/verification/bulk-resolve",
                        json={"resolution": "extracted"}, headers=auth)
     assert bulk.status_code == 200
-    assert client.get("/api/v1/leads/verification/queue", headers=auth).json() == []
+    cleared = client.get("/api/v1/leads/verification/queue", headers=auth).json()
+    assert cleared["items"] == []
+    assert cleared["stats"]["open"] == 0
 
 
 def test_enrich_and_score_with_custom_weights(client, auth):

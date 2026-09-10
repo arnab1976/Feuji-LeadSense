@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
 import PortalShell from "@/components/PortalShell";
-import { api } from "@/lib/api";
+import { api, ApiError } from "@/lib/api";
 import {
   AgentDecision,
   AgentExecution,
@@ -17,10 +18,11 @@ import {
   WorkflowHistoryEntry,
 } from "@/lib/types";
 
-/** Lead-processing agents shown in the Workflow roster (Orchestrator is the bot). */
+/** Lead-processing agents shown in the Workflow roster (Orchestrator is the bot).
+ *  Extraction still runs in the backend pipeline but is not a separate roster step —
+ *  Agent 01 Continue goes directly to Verification. */
 const ROSTER_KEYS = [
   "ingestion",
-  "extraction",
   "verification",
   "enrichment",
   "scoring",
@@ -35,7 +37,11 @@ function agentId(spec: AgentSpec): string {
 
 function rosterAgents(catalog: AgentSpec[]): AgentSpec[] {
   const byKey = new Map(catalog.map((a) => [a.key, a]));
-  return ROSTER_KEYS.map((key) => byKey.get(key)).filter(Boolean) as AgentSpec[];
+  return ROSTER_KEYS.map((key, index) => {
+    const spec = byKey.get(key);
+    if (!spec) return null;
+    return { ...spec, number: index + 1 };
+  }).filter(Boolean) as AgentSpec[];
 }
 
 const SOURCE_CONNECTORS = [
@@ -220,6 +226,93 @@ const LISTS = [
   },
 ];
 
+type ProspectList = (typeof LISTS)[number];
+type ExternalImportPhase = "review" | "streaming" | "results" | null;
+type IngestLogLevel = "info" | "ok" | "warn" | "err";
+type IngestLogLine = { at: string; text: string; level: IngestLogLevel };
+
+function bfsiListForConnector(connectorKey: string): ProspectList | null {
+  return (
+    LISTS.find((l) => l.connector_key === connectorKey && l.industry === "BFSI") ||
+    LISTS.find((l) => l.connector_key === connectorKey) ||
+    null
+  );
+}
+
+function stagingFileLabel(list: ProspectList | null, connectorKey: string): string {
+  if (list?.file) {
+    return list.file.replace(/\.csv$/i, ".xlsx");
+  }
+  return `${connectorKey}_bfsi_targets_q3.xlsx`;
+}
+
+function formatLogTime(d: Date): string {
+  return d.toLocaleTimeString("en-GB", {
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function buildIngestLogScript(
+  sync: NonNullable<ConnectImportResult["sync"]>,
+  fileLabel: string,
+  tenantLabel: string
+): IngestLogLine[] {
+  const fetched = sync.fetched || 0;
+  const created = sync.created || 0;
+  const duplicates = sync.duplicates || 0;
+  const invalid = sync.invalid || 0;
+  const base = new Date();
+  const stamp = (offsetSec: number) => {
+    const d = new Date(base.getTime() + offsetSec * 1000);
+    return formatLogTime(d);
+  };
+  return [
+    {
+      at: stamp(0),
+      text: `Reading ${fileLabel} from S3 staging bucket`,
+      level: "info",
+    },
+    {
+      at: stamp(0),
+      text: "Schema validation passed - 6 of 6 required fields present",
+      level: "ok",
+    },
+    {
+      at: stamp(0),
+      text: `Applying tenant column mapping rules for ${tenantLabel}`,
+      level: "info",
+    },
+    {
+      at: stamp(1),
+      text: `${fetched} rows parsed`,
+      level: "ok",
+    },
+    {
+      at: stamp(1),
+      text: `${invalid} rows failed syntax validation and were quarantined`,
+      level: "err",
+    },
+    {
+      at: stamp(1),
+      text: `${duplicates} duplicate records collapsed by email and company key`,
+      level: "warn",
+    },
+    {
+      at: stamp(2),
+      text: `${created} valid lead records persisted`,
+      level: "ok",
+    },
+    {
+      at: stamp(2),
+      text: "Background extraction queued via Celery",
+      level: "info",
+    },
+  ];
+}
+
 type PipelinePhase =
   | "idle"
   | "running"
@@ -234,6 +327,7 @@ type RunState = {
   pausedAt: string | null;
   openConflicts: number;
   created: number;
+  leadIds: string[];
   message: string;
 };
 
@@ -251,9 +345,11 @@ function nodeToStep(currentNode: string, status: string, pausedAt: string | null
 }
 
 function agentForPhase(activeStep: number, phase: PipelinePhase, currentNode: string): string {
-  if (phase === "paused" || activeStep === 4) return "03";
-  if (activeStep >= 6) return "05";
-  if (activeStep === 5) return "04";
+  // Roster: 01 Ingestion → 02 Verification → 03 Enrichment → 04 Scoring …
+  // Backend extraction (step 3) is skipped in the UI and maps to Verification.
+  if (phase === "paused" || activeStep === 4) return "02";
+  if (activeStep >= 6) return "04";
+  if (activeStep === 5) return "03";
   if (activeStep === 3) return "02";
   if (activeStep === 2 || currentNode.includes("pipeline.")) return "01";
   return "01";
@@ -262,10 +358,10 @@ function agentForPhase(activeStep: number, phase: PipelinePhase, currentNode: st
 const JOURNEY_STEPS = [
   { key: "ingestion", label: "01 Ingestion", detail: "Validate, dedupe, persist leads" },
   { key: "pipeline.start", label: "Orchestrator", detail: "Hand-off lead_ids · start pipeline" },
-  { key: "extraction", label: "02 Extraction", detail: "Canonical profile beside upload" },
-  { key: "verification", label: "03 Verification", detail: "Human gate · compare fields" },
-  { key: "enrichment", label: "04 Enrichment", detail: "Seniority, persona, firmographics" },
-  { key: "scoring", label: "05 Scoring", detail: "ICP band + factor evidence" },
+  { key: "extraction", label: "Extraction (auto)", detail: "Canonical profile beside upload" },
+  { key: "verification", label: "02 Verification", detail: "Human gate · compare fields" },
+  { key: "enrichment", label: "03 Enrichment", detail: "Seniority, persona, firmographics" },
+  { key: "scoring", label: "04 Scoring", detail: "ICP band + factor evidence" },
 ];
 
 function journeyFocus(currentNode: string, phase: PipelinePhase): string {
@@ -491,15 +587,146 @@ function OrchestratorBot({
     phase === "idle" ? "Idle" : phase === "running" || busy ? "Running" : phase;
   const focus = journeyFocus(currentNode, phase);
   const story = journeyNarrative(phase, currentNode, openConflicts, created, busy);
+  const dragRef = useRef<HTMLDivElement | null>(null);
+  const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
+  const dragState = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    origLeft: number;
+    origTop: number;
+    moved: boolean;
+  } | null>(null);
+  const DRAG_THRESHOLD_PX = 8;
+
+  const clampPos = (left: number, top: number, el?: HTMLElement | null) => {
+    const width = el?.offsetWidth || (minimized ? 200 : 340);
+    const height = el?.offsetHeight || (minimized ? 52 : 420);
+    const roster = document.querySelector(".wf-roster") as HTMLElement | null;
+    const topBar = document.querySelector(".wf-top") as HTMLElement | null;
+    const minLeft = roster ? Math.ceil(roster.getBoundingClientRect().right) + 8 : 12;
+    const minTop = topBar ? Math.ceil(topBar.getBoundingClientRect().bottom) + 8 : 66;
+    const maxLeft = Math.max(minLeft, window.innerWidth - width - 12);
+    const maxTop = Math.max(minTop, window.innerHeight - height - 12);
+    return {
+      left: Math.min(maxLeft, Math.max(minLeft, left)),
+      top: Math.min(maxTop, Math.max(minTop, top)),
+    };
+  };
+
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem("leadsense.orchPos");
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as { left: number; top: number };
+      if (typeof parsed.left === "number" && typeof parsed.top === "number") {
+        setPos(clampPos(parsed.left, parsed.top));
+      }
+    } catch {
+      /* ignore */
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const onResize = () => {
+      setPos((prev) => {
+        if (!prev) return prev;
+        return clampPos(prev.left, prev.top, dragRef.current);
+      });
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [minimized, open]);
+
+  const style =
+    pos != null
+      ? ({ left: pos.left, top: pos.top, right: "auto", bottom: "auto" } as const)
+      : undefined;
+
+  const beginDrag = (e: ReactPointerEvent, el: HTMLElement) => {
+    if (e.button !== 0) return;
+    const target = e.target as HTMLElement;
+    if (
+      target.closest(
+        "a, .orch-bot-actions button, .orch-bot-cta a, .orch-bot-cta button, input, select, textarea"
+      )
+    ) {
+      return;
+    }
+    const rect = el.getBoundingClientRect();
+    const current = pos || { left: rect.left, top: rect.top };
+    dragState.current = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      origLeft: current.left,
+      origTop: current.top,
+      moved: false,
+    };
+    el.setPointerCapture(e.pointerId);
+  };
+
+  const moveDrag = (e: ReactPointerEvent) => {
+    const state = dragState.current;
+    if (!state || state.pointerId !== e.pointerId) return;
+    const dx = e.clientX - state.startX;
+    const dy = e.clientY - state.startY;
+    if (!state.moved && (Math.abs(dx) > DRAG_THRESHOLD_PX || Math.abs(dy) > DRAG_THRESHOLD_PX)) {
+      state.moved = true;
+    }
+    if (!state.moved) return;
+    e.preventDefault();
+    setPos(clampPos(state.origLeft + dx, state.origTop + dy, dragRef.current));
+  };
+
+  const endDrag = (e: ReactPointerEvent, onTap?: () => void) => {
+    const state = dragState.current;
+    if (!state || state.pointerId !== e.pointerId) return;
+    const moved = state.moved;
+    dragState.current = null;
+    try {
+      dragRef.current?.releasePointerCapture(e.pointerId);
+    } catch {
+      /* ignore */
+    }
+    if (!moved) {
+      onTap?.();
+      return;
+    }
+    setPos((prev) => {
+      if (!prev) return prev;
+      const next = clampPos(prev.left, prev.top, dragRef.current);
+      try {
+        window.localStorage.setItem("leadsense.orchPos", JSON.stringify(next));
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+  };
 
   if (!open || minimized) {
     return (
-      <div className="orch-bot-dock">
+      <div
+        ref={dragRef}
+        className="orch-bot-dock"
+        style={style}
+        onPointerDown={(e) => {
+          if (dragRef.current) beginDrag(e, dragRef.current);
+        }}
+        onPointerMove={moveDrag}
+        onPointerUp={(e) => endDrag(e, onOpen)}
+        onPointerCancel={(e) => endDrag(e)}
+      >
         <button
           type="button"
           className={`orch-bot-fab ${live ? "live" : ""} status-${phase}`}
-          onClick={onOpen}
+          // Open is handled on pointer-up (tap vs drag). Prevent duplicate click.
+          onClick={(e) => e.preventDefault()}
           aria-label="Open Workflow Orchestrator"
+          aria-expanded={false}
         >
           <span className="orch-bot-fab-pulse" aria-hidden />
           <span className="orch-bot-fab-label">
@@ -517,18 +744,45 @@ function OrchestratorBot({
   }
 
   return (
-    <aside className="orch-bot" aria-label="Workflow Orchestrator">
-      <header className="orch-bot-head">
+    <aside
+      ref={dragRef}
+      className="orch-bot"
+      aria-label="Workflow Orchestrator"
+      style={style}
+      onPointerDown={(e) => {
+        if (dragRef.current) beginDrag(e, dragRef.current);
+      }}
+      onPointerMove={moveDrag}
+      onPointerUp={(e) => endDrag(e)}
+      onPointerCancel={(e) => endDrag(e)}
+    >
+      <header className="orch-bot-head orch-bot-drag-handle">
         <div>
-          <div className="orch-bot-kicker">System · Journey control</div>
+          <div className="orch-bot-kicker">System · Journey control · Drag to move</div>
           <strong>Workflow Orchestrator</strong>
           <div className="orch-bot-status-line">{statusLabel}</div>
         </div>
         <div className="orch-bot-actions">
-          <button type="button" className="orch-bot-icon" onClick={onMinimize} title="Minimize">
+          <button
+            type="button"
+            className="orch-bot-icon"
+            onClick={(e) => {
+              e.stopPropagation();
+              onMinimize();
+            }}
+            title="Minimize"
+          >
             —
           </button>
-          <button type="button" className="orch-bot-icon" onClick={onClose} title="Close">
+          <button
+            type="button"
+            className="orch-bot-icon"
+            onClick={(e) => {
+              e.stopPropagation();
+              onMinimize();
+            }}
+            title="Dock Orchestrator"
+          >
             ×
           </button>
         </div>
@@ -922,6 +1176,7 @@ function AgentRoster({
 }
 
 export default function WorkflowPage() {
+  const router = useRouter();
   const [selectedList, setSelectedList] = useState<string | null>(null);
   const [selectedSource, setSelectedSource] = useState<string | null>(null);
   const [uploadFile, setUploadFile] = useState<File | null>(null);
@@ -932,6 +1187,7 @@ export default function WorkflowPage() {
   } | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [selectedAgent, setSelectedAgent] = useState("01");
+  const [followPipelineAgent, setFollowPipelineAgent] = useState(true);
   const [detailAgentId, setDetailAgentId] = useState<string | null>(null);
   const [catalog, setCatalog] = useState<AgentSpec[]>([]);
   const [agentExecutions, setAgentExecutions] = useState<AgentExecution[]>([]);
@@ -946,6 +1202,16 @@ export default function WorkflowPage() {
   const [connectBusy, setConnectBusy] = useState<"test" | "import" | "">("");
   const [connectNotice, setConnectNotice] = useState("");
   const [importMode, setImportMode] = useState<string>("");
+  const [externalImportPhase, setExternalImportPhase] =
+    useState<ExternalImportPhase>(null);
+  const [pendingLiveImport, setPendingLiveImport] =
+    useState<ConnectImportResult | null>(null);
+  const [externalReviewList, setExternalReviewList] =
+    useState<ProspectList | null>(null);
+  const [externalSchema, setExternalSchema] = useState<FixturePreview | null>(null);
+  const [externalSchemaBusy, setExternalSchemaBusy] = useState(false);
+  const [ingestLogs, setIngestLogs] = useState<IngestLogLine[]>([]);
+  const [ingestValidating, setIngestValidating] = useState(false);
   const [sampleOpen, setSampleOpen] = useState(false);
   const [sampleBusy, setSampleBusy] = useState(false);
   const [samplePreview, setSamplePreview] = useState<FixturePreview | null>(null);
@@ -959,6 +1225,7 @@ export default function WorkflowPage() {
     pausedAt: null,
     openConflicts: 0,
     created: 0,
+    leadIds: [],
     message: "",
   });
 
@@ -1022,19 +1289,56 @@ export default function WorkflowPage() {
   );
 
   useEffect(() => {
-    setSelectedAgent(agentForPhase(activeStep, run.phase, run.currentNode));
-  }, [activeStep, run.phase, run.currentNode]);
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const agent =
+        params.get("agent") ||
+        window.sessionStorage.getItem("leadsense.selectedAgent") ||
+        "";
+      if (/^\d{2}$/.test(agent)) {
+        setSelectedAgent(agent);
+        setFollowPipelineAgent(false);
+        window.sessionStorage.removeItem("leadsense.selectedAgent");
+      }
+      const wf =
+        params.get("workflow_id") ||
+        window.sessionStorage.getItem("leadsense.workflowId") ||
+        "";
+      if (wf) {
+        setRun((prev) => ({ ...prev, workflowId: wf }));
+        void refreshWorkflow(wf).catch(() => {
+          /* keep idle timeline */
+        });
+      }
+    } catch {
+      /* ignore */
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
-    if (run.phase === "running" || run.phase === "paused" || busy) {
-      setBotOpen(true);
-      setBotMinimized(false);
-    }
-  }, [run.phase, busy]);
+    if (!followPipelineAgent) return;
+    if (run.phase === "idle") return;
+    setSelectedAgent(agentForPhase(activeStep, run.phase, run.currentNode));
+  }, [activeStep, run.phase, run.currentNode, followPipelineAgent]);
 
   const selectRosterItem = (id: string) => {
+    setFollowPipelineAgent(false);
     setSelectedAgent(id);
     setDetailAgentId(id);
+  };
+
+  const goToNextAgent = () => {
+    setFollowPipelineAgent(false);
+    const ids = agents.map((a) => agentId(a));
+    const idx = ids.indexOf(selectedAgent);
+    if (idx >= 0 && idx < ids.length - 1) {
+      const next = ids[idx + 1];
+      setSelectedAgent(next);
+      setDetailAgentId(null);
+      return;
+    }
+    router.push("/leads");
   };
 
   const detailAgent = useMemo(
@@ -1106,7 +1410,7 @@ export default function WorkflowPage() {
     setSampleBusy(false);
   }, [selectedList]);
 
-  const displayDatasetSample = async () => {
+  const startExtractionDisplay = async () => {
     if (!selectedDataset) return;
     if (sampleOpen) {
       setSampleOpen(false);
@@ -1116,12 +1420,12 @@ export default function WorkflowPage() {
     setError("");
     try {
       const preview = await api.get<FixturePreview>(
-        `/sources/fixtures/${encodeURIComponent(selectedDataset.file)}/preview?limit=10`
+        `/sources/fixtures/${encodeURIComponent(selectedDataset.file)}/preview?limit=50`
       );
       setSamplePreview(preview);
       setSampleOpen(true);
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "Could not load sample data");
+      setError(e instanceof Error ? e.message : "Could not load dataset");
       setSampleOpen(false);
       setSamplePreview(null);
     } finally {
@@ -1151,6 +1455,9 @@ export default function WorkflowPage() {
         ? String(detail.state?.paused_at || detail.current_node || "verification")
         : null;
     const openConflicts = Number(detail.state?.open_conflicts || 0);
+    const leadIds = Array.isArray(detail.state?.lead_ids)
+      ? (detail.state.lead_ids as string[])
+      : [];
     setRun((prev) => ({
       ...prev,
       workflowId,
@@ -1163,6 +1470,7 @@ export default function WorkflowPage() {
       currentNode: detail.current_node,
       pausedAt,
       openConflicts,
+      leadIds: leadIds.length ? leadIds : prev.leadIds,
       message:
         detail.status === "paused"
           ? `Pipeline paused at verification — ${openConflicts || "open"} conflict(s) need human review.`
@@ -1251,12 +1559,23 @@ export default function WorkflowPage() {
     [connections, selectedSource]
   );
 
+  const clearExternalImportFlow = () => {
+    setExternalImportPhase(null);
+    setPendingLiveImport(null);
+    setExternalReviewList(null);
+    setExternalSchema(null);
+    setExternalSchemaBusy(false);
+    setIngestLogs([]);
+    setIngestValidating(false);
+  };
+
   const selectSource = (key: string) => {
     setSelectedSource(key);
     setError("");
     setSelectedList(null);
     setConnectNotice("");
     setImportMode("");
+    clearExternalImportFlow();
     if (key === "manual_upload") {
       setUploadFile(null);
       setUploadPreview(null);
@@ -1266,6 +1585,72 @@ export default function WorkflowPage() {
       setUploadFile(null);
       setUploadPreview(null);
       hydrateConnectForm(key, connectorCatalog, connections);
+    }
+  };
+
+  const beginExternalLiveReview = async (res: ConnectImportResult) => {
+    const connectorKey = res.connector_key || selectedSource || "";
+    const list = bfsiListForConnector(connectorKey);
+    setPendingLiveImport(res);
+    setExternalReviewList(list);
+    setExternalImportPhase("review");
+    setIngestLogs([]);
+    setImportMode(res.mode);
+    setConnectNotice(res.message);
+    if (res.connection) {
+      setConnections((prev) => {
+        const others = prev.filter((c) => c.id !== res.connection!.id);
+        return [...others, res.connection!];
+      });
+    }
+    if (list) {
+      setSelectedList(list.id);
+      setExternalSchemaBusy(true);
+      try {
+        const preview = await api.get<FixturePreview>(
+          `/sources/fixtures/${encodeURIComponent(list.file)}/preview?limit=8`
+        );
+        setExternalSchema(preview);
+      } catch {
+        setExternalSchema(null);
+      } finally {
+        setExternalSchemaBusy(false);
+      }
+    } else {
+      setExternalSchema(null);
+    }
+  };
+
+  const validateAndCreateIngestionJob = async () => {
+    if (!pendingLiveImport?.sync || ingestValidating) return;
+    const sync = pendingLiveImport.sync;
+    const fileLabel = stagingFileLabel(
+      externalReviewList,
+      pendingLiveImport.connector_key || selectedSource || "source"
+    );
+    const tenantLabel = "TEN-001";
+    const script = buildIngestLogScript(sync, fileLabel, tenantLabel);
+
+    setIngestValidating(true);
+    setExternalImportPhase("streaming");
+    setIngestLogs([]);
+    setError("");
+
+    try {
+      for (let i = 0; i < script.length; i += 1) {
+        await new Promise((r) => window.setTimeout(r, i === 0 ? 280 : 420));
+        setIngestLogs((prev) => [...prev, script[i]]);
+      }
+      await new Promise((r) => window.setTimeout(r, 500));
+      setExternalImportPhase("results");
+      await applyConnectResult(pendingLiveImport);
+    } catch (e: unknown) {
+      setError(
+        e instanceof Error ? e.message : "Could not create ingestion job"
+      );
+      setExternalImportPhase("review");
+    } finally {
+      setIngestValidating(false);
     }
   };
 
@@ -1293,6 +1678,11 @@ export default function WorkflowPage() {
     const openConflicts = sync.open_conflicts || 0;
     const created = sync.created;
     await refreshWorkflow(sync.workflow_id);
+    try {
+      window.sessionStorage.setItem("leadsense.workflowId", sync.workflow_id);
+    } catch {
+      /* ignore */
+    }
     setRun((prev) => ({
       ...prev,
       created,
@@ -1359,18 +1749,7 @@ export default function WorkflowPage() {
     setBusy(true);
     setError("");
     setConnectNotice("");
-    setBotOpen(true);
-    setBotMinimized(false);
-    setRun((prev) => ({
-      ...prev,
-      phase: "running",
-      message: `Connecting to ${selectedConnector?.display_name || selectedSource} and importing…`,
-      currentNode: "ingestion",
-      pausedAt: null,
-      openConflicts: 0,
-      workflowId: "",
-    }));
-    setWorkflowDetail(null);
+    clearExternalImportFlow();
     try {
       const res = await runConnectAndImport({
         testOnly: false,
@@ -1382,18 +1761,28 @@ export default function WorkflowPage() {
         setImportMode(res.mode);
         setConnectNotice(res.message);
         setError(res.message);
-        setRun((prev) => ({
-          ...prev,
-          phase: "idle",
-          message: "",
-          currentNode: "",
-        }));
-        setWorkflowDetail(null);
         return;
       }
+      // Live external imports get the BFSI review → Validate → stream → results flow.
+      // Demo / fallback paths keep the existing immediate apply behaviour.
+      if (res.mode === "live" && res.sync) {
+        await beginExternalLiveReview(res);
+        return;
+      }
+      setRun((prev) => ({
+        ...prev,
+        phase: "running",
+        message: `Connecting to ${selectedConnector?.display_name || selectedSource} and importing…`,
+        currentNode: "ingestion",
+        pausedAt: null,
+        openConflicts: 0,
+        workflowId: "",
+      }));
+      setWorkflowDetail(null);
       await applyConnectResult(res);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Connect and import failed");
+      clearExternalImportFlow();
       setRun((prev) => ({
         ...prev,
         phase: "idle",
@@ -1427,17 +1816,17 @@ export default function WorkflowPage() {
     }
   };
 
-  const continuePipeline = async () => {
+  const continuePipeline = async (): Promise<boolean> => {
     const list = selectedList ? LISTS.find((item) => item.id === selectedList) : null;
     const sourceKey =
       selectedSource || list?.connector_key || null;
     if (!sourceKey) {
       setError("Select a source connector first.");
-      return;
+      return false;
     }
     if (sourceKey === "manual_upload" && !uploadFile && !list) {
       setError("Upload a local CSV/Excel file or choose an upload prospect list.");
-      return;
+      return false;
     }
     // External sources: prefer live connect-and-import. Demo lists only when
     // the user explicitly picked a canned list (or has no credentials yet).
@@ -1449,14 +1838,12 @@ export default function WorkflowPage() {
         setError(
           "Enter live credentials and click Connect & Import, or pick a demo prospect list."
         );
-        return;
+        return false;
       }
     }
 
     setBusy(true);
     setError("");
-    setBotOpen(true);
-    setBotMinimized(false);
     setRun((prev) => ({
       ...prev,
       phase: "running",
@@ -1490,6 +1877,9 @@ export default function WorkflowPage() {
         pausedAt = res.paused_at || null;
         openConflicts = res.open_conflicts || 0;
         created = res.rows_valid;
+        if (res.lead_ids?.length) {
+          setRun((prev) => ({ ...prev, leadIds: res.lead_ids }));
+        }
       } else {
         const hasAnyConfig = Object.values(connectConfig).some(
           (v) => v != null && String(v).trim() !== "" && String(v) !== "********"
@@ -1517,7 +1907,7 @@ export default function WorkflowPage() {
             currentNode: "",
           }));
           setWorkflowDetail(null);
-          return;
+          return false;
         }
         if (res.connection) {
           setConnections((prev) => {
@@ -1533,7 +1923,7 @@ export default function WorkflowPage() {
             message: "",
             currentNode: "",
           }));
-          return;
+          return false;
         }
         workflowId = res.sync.workflow_id;
         pausedAt = res.sync.paused_at || null;
@@ -1559,13 +1949,112 @@ export default function WorkflowPage() {
           message: `Ingested ${created} leads.`,
         }));
       }
+      return true;
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : "Pipeline run failed";
       setError(message);
       setRun((prev) => ({ ...prev, phase: "error", message }));
+      return false;
     } finally {
       setBusy(false);
     }
+  };
+
+  const handleContinue = () => {
+    // Agent 01: ingest selected fixture (canonical extract → verify), then open bench.
+    if (selectedAgent === "01") {
+      void (async () => {
+        const list = selectedDataset;
+        let wf = run.workflowId || workflowDetail?.workflow_id || "";
+
+        if (list?.file) {
+          setBusy(true);
+          setError("");
+          setRun((prev) => ({
+            ...prev,
+            phase: "running",
+            message: `Running ${list.title} through extract → verify (canonical profiles)…`,
+            currentNode: "extraction",
+            pausedAt: null,
+            openConflicts: 0,
+          }));
+          try {
+            const qs = new URLSearchParams({
+              filename: list.file,
+              limit: String(Math.min(list.rows || 50, 50)),
+              run_pipeline: "true",
+              connector_key: list.connector_key || "manual_upload",
+            });
+            const res = await api.post<{
+              workflow_id: string;
+              open_conflicts?: number;
+              paused_at?: string | null;
+              rows_valid?: number;
+              lead_ids?: string[];
+              status?: string;
+            }>(`/sources/fixtures/run?${qs.toString()}`, {});
+            wf = res.workflow_id || "";
+            const openConflicts = res.open_conflicts || 0;
+            const pausedAt = res.paused_at || null;
+            setRun((prev) => ({
+              ...prev,
+              workflowId: wf,
+              leadIds: res.lead_ids || prev.leadIds,
+              created: res.rows_valid ?? prev.created,
+              openConflicts,
+              pausedAt,
+              phase:
+                openConflicts > 0 || pausedAt === "verification"
+                  ? "paused"
+                  : "completed",
+              currentNode: pausedAt || "verification",
+              message:
+                openConflicts > 0
+                  ? `Pipeline paused — ${openConflicts} verification conflict(s) after canonical_profile.`
+                  : "Fixture verified; opening Verification workbench.",
+            }));
+          } catch (e: unknown) {
+            const message =
+              e instanceof ApiError
+                ? e.status === 404
+                  ? "Verification run endpoint not found. Confirm the API on port 8000 is running the latest code."
+                  : e.message
+                : e instanceof Error
+                  ? e.message
+                  : "Could not run fixture for verification";
+            setError(message);
+            setRun((prev) => ({
+              ...prev,
+              phase: "error",
+              message,
+            }));
+            setBusy(false);
+            return;
+          } finally {
+            setBusy(false);
+          }
+        }
+
+        if (!wf) {
+          setError(
+            "Select a prospect list (or Connect & Import) first, then open the Verification bench."
+          );
+          return;
+        }
+
+        setFollowPipelineAgent(false);
+        setSelectedAgent("02");
+        setDetailAgentId(null);
+        try {
+          window.sessionStorage.setItem("leadsense.workflowId", wf);
+        } catch {
+          /* ignore */
+        }
+        router.push(`/verification?workflow_id=${encodeURIComponent(wf)}`);
+      })();
+      return;
+    }
+    goToNextAgent();
   };
 
   const stage = (() => {
@@ -1575,33 +2064,27 @@ export default function WorkflowPage() {
         body: "Agent 01 accepts RawLead[] from seven source connectors, validates schema, dedupes on email or name|company, persists leads as ingested, and returns lead_ids + job stats. Watch the Orchestrator bot (bottom-right) for live checkpoints.",
       };
     }
-    if (run.phase === "paused" || selectedAgent === "03") {
+    if (run.phase === "paused" || selectedAgent === "02") {
       return {
         title: "Verification",
         body: "Conflicts were found between uploaded and extracted values. The Orchestrator paused the workflow — enrichment and scoring stay blocked until a reviewer resolves each field.",
       };
     }
-    if (run.phase === "completed" || selectedAgent === "05") {
+    if (run.phase === "completed" || selectedAgent === "04") {
       return {
         title: "ICP scoring",
         body: "Trusted leads were enriched and scored. Open Leads or Analytics to inspect bands, factors and evidence for this workflow.",
       };
     }
-    if (selectedAgent === "04" || activeStep >= 5) {
+    if (selectedAgent === "03" || activeStep >= 5) {
       return {
         title: "Enrichment",
         body: "Verification cleared. Enrichment is normalizing titles, seniority and persona signals before scoring.",
       };
     }
-    if (selectedAgent === "02" || (activeStep >= 3 && run.phase === "running")) {
-      return {
-        title: "Extraction",
-        body: "Lead Ingestion finished. Extraction is pulling canonical profiles before the verification gate.",
-      };
-    }
     return {
       title: "Lead Ingestion",
-      body: "Pick a prospect list. Continue runs Agent 01 Ingestion, then the Orchestrator bot (bottom-right) streams checkpoints through verification.",
+      body: "Pick a prospect list or Connect & Import on Agent 01. Continue opens Verification next — extraction still runs automatically in the pipeline.",
     };
   })();
 
@@ -1657,62 +2140,23 @@ export default function WorkflowPage() {
         </div>
       ) : null}
 
-      {selectedAgent === "03" ? (
+      {selectedAgent === "02" ? (
         <section className="wf-panel">
-          <h2>Agent 03 · Verification (human gate)</h2>
+          <h2>Agent 02 · Verification (human gate)</h2>
           <p className="wf-panel-sub">
             Compares uploaded vs extracted title, company, location and email.
             MISMATCH / NEEDS_REVIEW pauses the Orchestrator; enrichment and scoring
             stay blocked until a reviewer resolves each field.
           </p>
           <p className="hint" style={{ marginBottom: 0 }}>
-            Run Continue on Agent 01 to produce conflicts, then open{" "}
-            <Link href="/verification">Verification</Link>
-            {" · "}
-            <button
-              type="button"
-              className="linkish"
-              onClick={() => {
-                setBotOpen(true);
-                setBotMinimized(false);
-              }}
-            >
-              Open Orchestrator bot
-            </button>
-            .
+            Run Connect &amp; Import on Agent 01 to produce conflicts, then open{" "}
+            <Link href="/verification">Verification</Link>. Click the Orchestrator
+            pill to review live agent checkpoints.
           </p>
         </section>
-      ) : selectedAgent === "02" ? (
+      ) : selectedAgent === "03" ? (
         <section className="wf-panel">
-          <h2>Agent 02 · Extraction</h2>
-          <p className="wf-panel-sub">
-            Fetches the canonical profile beside the upload (never overwrites it),
-            normalises titles / companies / email, and stores a snapshot for
-            Verification.
-          </p>
-          <ul className="wf-supervisor-flow">
-            <li>Policy check on the source connection</li>
-            <li>Canonical demo profile or upload fallback</li>
-            <li>Normalised title, company, email, phone in payload</li>
-          </ul>
-          {workflowDetail?.history?.length ? (
-            <p className="hint" style={{ marginTop: 12, marginBottom: 0 }}>
-              History:{" "}
-              {workflowDetail.history
-                .map((h) => h.node)
-                .filter(Boolean)
-                .slice(-6)
-                .join(" → ")}
-            </p>
-          ) : (
-            <p className="hint" style={{ marginTop: 12, marginBottom: 0 }}>
-              Extraction runs automatically after Ingestion + Orchestrator start.
-            </p>
-          )}
-        </section>
-      ) : selectedAgent === "04" ? (
-        <section className="wf-panel">
-          <h2>Agent 04 · Enrichment</h2>
+          <h2>Agent 03 · Enrichment</h2>
           <p className="wf-panel-sub">
             Runs only after Verification is clear. Infers seniority, function,
             persona and attaches firmographic / technographic signals from the
@@ -1734,9 +2178,9 @@ export default function WorkflowPage() {
             </p>
           )}
         </section>
-      ) : selectedAgent === "05" ? (
+      ) : selectedAgent === "04" ? (
         <section className="wf-panel">
-          <h2>Agent 05 · ICP &amp; Lead Scoring</h2>
+          <h2>Agent 04 · ICP &amp; Lead Scoring</h2>
           <p className="wf-panel-sub">
             Weighted ICP score (0–100) with HOT / HIGH / MEDIUM / LOW bands and
             factor evidence. Requires an enrichment row first.
@@ -1985,6 +2429,213 @@ export default function WorkflowPage() {
             </div>
           ) : null}
 
+          {externalImportPhase && pendingLiveImport?.sync ? (
+            <div className="wf-external-ingest">
+              {externalImportPhase === "review" ? (
+                <>
+                  <h3 className="wf-subhead">Staged external dataset</h3>
+                  <p className="hint" style={{ marginTop: 0, marginBottom: 10 }}>
+                    Live import from{" "}
+                    <strong>
+                      {selectedConnector?.display_name ||
+                        pendingLiveImport.connector_key}
+                    </strong>{" "}
+                    is ready. Review the BFSI prospect list and schema, then
+                    validate to create the ingestion job.
+                  </p>
+                  {externalReviewList ? (
+                    <div className="wf-list-card selected wf-external-list-card">
+                      <strong>{externalReviewList.title}</strong>
+                      <span className="wf-list-desc">
+                        {externalReviewList.description}
+                      </span>
+                      <span className="wf-list-meta">
+                        <span className="wf-list-tags">
+                          <span className="badge medium">
+                            {externalReviewList.connector_key}
+                          </span>
+                          <span className="badge neutral">
+                            {externalReviewList.industry}
+                          </span>
+                          <span className="badge ok">live import</span>
+                        </span>
+                        <span
+                          className="wf-list-file mono"
+                          title={externalReviewList.file}
+                        >
+                          {stagingFileLabel(
+                            externalReviewList,
+                            pendingLiveImport.connector_key
+                          )}
+                        </span>
+                      </span>
+                    </div>
+                  ) : null}
+
+                  <div className="wf-dataset-preview" style={{ marginTop: 12 }}>
+                    <div className="wf-dataset-preview-head">
+                      <div>
+                        <strong>Schema details</strong>
+                        <p>
+                          Required RawLead fields and sample columns from the
+                          staged BFSI extract.
+                        </p>
+                      </div>
+                      <span className="badge agent">
+                        {pendingLiveImport.sync.fetched} fetched
+                      </span>
+                    </div>
+                    <div className="wf-dataset-preview-grid">
+                      <span>
+                        <strong>Source file</strong>
+                        <em className="mono">
+                          {stagingFileLabel(
+                            externalReviewList,
+                            pendingLiveImport.connector_key
+                          )}
+                        </em>
+                      </span>
+                      <span>
+                        <strong>Rows staged</strong>
+                        <em>{pendingLiveImport.sync.fetched} observations</em>
+                      </span>
+                      <span>
+                        <strong>Industry</strong>
+                        <em>{externalReviewList?.industry || "BFSI"}</em>
+                      </span>
+                      <span>
+                        <strong>Job</strong>
+                        <em className="mono">
+                          {pendingLiveImport.sync.job_id || "pending"}
+                        </em>
+                      </span>
+                      <span>
+                        <strong>Fields</strong>
+                        <em>
+                          {externalSchemaBusy
+                            ? "Loading schema…"
+                            : externalSchema?.headers?.length
+                              ? externalSchema.headers.join(", ")
+                              : "external_id, full_name, email, title, company_name, location, industry, employee_count"}
+                        </em>
+                      </span>
+                      <span>
+                        <strong>Required</strong>
+                        <em>
+                          full_name, email, title, company_name, location,
+                          industry
+                        </em>
+                      </span>
+                    </div>
+                    {externalSchema?.sample_rows?.length ? (
+                      <div className="wf-sample-panel" style={{ marginTop: 10 }}>
+                        <p className="hint" style={{ marginTop: 0 }}>
+                          Sample rows ({externalSchema.sample_count} of{" "}
+                          {externalSchema.rows_total})
+                        </p>
+                        <div className="wf-sample-table-wrap">
+                          <table className="wf-sample-table">
+                            <thead>
+                              <tr>
+                                {(externalSchema.headers || [])
+                                  .slice(0, 6)
+                                  .map((h) => (
+                                    <th key={h}>{h}</th>
+                                  ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {externalSchema.sample_rows.slice(0, 5).map((row, idx) => (
+                                <tr key={idx}>
+                                  {(externalSchema.headers || [])
+                                    .slice(0, 6)
+                                    .map((h) => (
+                                      <td key={h}>{row[h] || "—"}</td>
+                                    ))}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <div className="wf-connect-actions" style={{ marginTop: 14 }}>
+                    <button
+                      type="button"
+                      disabled={ingestValidating || busy}
+                      onClick={() => void validateAndCreateIngestionJob()}
+                    >
+                      Validate &amp; Create Ingestion Job
+                    </button>
+                  </div>
+                </>
+              ) : null}
+
+              {externalImportPhase === "streaming" ||
+              (externalImportPhase === "results" && ingestLogs.length) ? (
+                <div className="wf-ingest-job">
+                  <div className="wf-ingest-job-head">
+                    <h3>Ingestion job</h3>
+                    <p className="mono">
+                      job_id: {pendingLiveImport.sync.job_id || "JOB-pending"}{" "}
+                      | tenant: TEN-001
+                    </p>
+                  </div>
+                  <div className="wf-ingest-console" aria-live="polite">
+                    {ingestLogs.map((line, idx) => (
+                      <div
+                        key={`${line.at}-${idx}`}
+                        className={`wf-ingest-line level-${line.level}`}
+                      >
+                        <span className="wf-ingest-ts">{line.at}</span>
+                        <span className="wf-ingest-msg">{line.text}</span>
+                      </div>
+                    ))}
+                    {externalImportPhase === "streaming" ? (
+                      <div className="wf-ingest-line level-info">
+                        <span className="wf-ingest-ts">…</span>
+                        <span className="wf-ingest-msg">Processing…</span>
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
+
+              {externalImportPhase === "results" ? (
+                <div className="wf-ingest-results">
+                  <div className="wf-ingest-stat">
+                    <span>Rows read</span>
+                    <strong>{pendingLiveImport.sync.fetched}</strong>
+                    <em>
+                      from{" "}
+                      {stagingFileLabel(
+                        externalReviewList,
+                        pendingLiveImport.connector_key
+                      )}
+                    </em>
+                  </div>
+                  <div className="wf-ingest-stat ok">
+                    <span>Valid records</span>
+                    <strong>{pendingLiveImport.sync.created}</strong>
+                    <em>queued for extraction</em>
+                  </div>
+                  <div className="wf-ingest-stat warn">
+                    <span>Duplicates collapsed</span>
+                    <strong>{pendingLiveImport.sync.duplicates}</strong>
+                    <em>email + company key</em>
+                  </div>
+                  <div className="wf-ingest-stat err">
+                    <span>Quarantined</span>
+                    <strong>{pendingLiveImport.sync.invalid}</strong>
+                    <em>failed syntax validation</em>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
           <h3 className="wf-subhead">
             {selectedSource
               ? selectedSource === "manual_upload"
@@ -2010,6 +2661,7 @@ export default function WorkflowPage() {
                     : "wf-list-card"
                 }
                 onClick={() => {
+                  clearExternalImportFlow();
                   setSelectedList(list.id);
                   setSelectedSource(list.connector_key);
                   if (list.connector_key !== "manual_upload") {
@@ -2022,7 +2674,7 @@ export default function WorkflowPage() {
                     );
                   }
                 }}
-                disabled={busy || Boolean(connectBusy)}
+                disabled={busy || Boolean(connectBusy) || ingestValidating}
               >
                 <strong>{list.title}</strong>
                 <span className="wf-list-desc">{list.description}</span>
@@ -2047,18 +2699,6 @@ export default function WorkflowPage() {
                 </div>
                 <div className="wf-dataset-preview-actions">
                   <span className="badge agent">{selectedDataset.connector_key}</span>
-                  <button
-                    type="button"
-                    className="secondary small"
-                    disabled={busy || sampleBusy}
-                    onClick={() => void displayDatasetSample()}
-                  >
-                    {sampleBusy
-                      ? "Loading…"
-                      : sampleOpen
-                        ? "Hide sample"
-                        : "Display sample"}
-                  </button>
                 </div>
               </div>
               <div className="wf-dataset-preview-grid">
@@ -2092,10 +2732,24 @@ export default function WorkflowPage() {
                 </span>
               </div>
 
+              <div className="wf-connect-actions" style={{ marginTop: 14 }}>
+                <button
+                  type="button"
+                  disabled={busy || sampleBusy}
+                  onClick={() => void startExtractionDisplay()}
+                >
+                  {sampleBusy
+                    ? "Loading…"
+                    : sampleOpen
+                      ? "Hide dataset"
+                      : "Start Extraction"}
+                </button>
+              </div>
+
               {sampleOpen && samplePreview ? (
                 <div className="wf-sample-panel">
                   <div className="wf-sample-panel-head">
-                    <strong>Sample data</strong>
+                    <strong>Dataset</strong>
                     <span className="hint">
                       Showing {samplePreview.sample_count} of{" "}
                       {samplePreview.rows_total || selectedDataset.rows} rows from{" "}
@@ -2147,16 +2801,14 @@ export default function WorkflowPage() {
       <div className="wf-footer">
         <div className="wf-info">
           {run.phase === "paused"
-            ? "Pipeline paused for human review. Resolve conflicts, then enrichment and scoring continue automatically."
-            : selectedSource || selectedList
-              ? selectedSource === "manual_upload" && uploadFile
-                ? `Ready to ingest ${uploadFile.name}. Continue runs Ingestion → Orchestrator → Extraction → Verification.`
-                : selectedSource !== "manual_upload"
-                  ? "Ready. Connect & Import for live data, or Continue with credentials / a demo list."
-                  : "Ready. Continue triggers Source → Ingestion → Orchestrator → Extraction → Verification."
-              : "Select a source connector (or prospect list) before Continue."}
+            ? "Pipeline paused for human review. Resolve conflicts on Verification, or Continue to the next agent."
+            : selectedAgent === "01"
+              ? "Select a prospect list, then Open the Verification bench — the fixture runs extract → verify with canonical_profile so mismatches appear."
+              : selectedAgent === "02"
+                ? "Resolve conflicts on Verification, or Continue to Enrichment."
+                : "Continue opens the next agent in the roster (or Leads after the last agent). Use Connect & Import on Agent 01 to run ingestion."}
         </div>
-        {run.phase === "paused" ? (
+        {run.phase === "paused" && selectedAgent === "02" ? (
           <Link className="wf-continue" href="/verification" style={{ textAlign: "center" }}>
             Review conflicts
           </Link>
@@ -2164,10 +2816,10 @@ export default function WorkflowPage() {
           <button
             type="button"
             className="wf-continue"
-            disabled={(!selectedSource && !selectedList) || busy}
-            onClick={continuePipeline}
+            disabled={busy}
+            onClick={handleContinue}
           >
-            {busy ? "Running…" : "Continue"}
+            {selectedAgent === "01" ? "Open the Verification bench" : "Continue"}
           </button>
         )}
       </div>
@@ -2187,14 +2839,19 @@ export default function WorkflowPage() {
         open={botOpen}
         minimized={botMinimized}
         onOpen={() => {
+          // Only the Orchestrator pill expands the bot panel.
           setBotOpen(true);
           setBotMinimized(false);
         }}
         onClose={() => {
-          setBotOpen(false);
+          // Dock to pill — never fully remove the bot from the canvas.
+          setBotOpen(true);
           setBotMinimized(true);
         }}
-        onMinimize={() => setBotMinimized(true)}
+        onMinimize={() => {
+          setBotOpen(true);
+          setBotMinimized(true);
+        }}
         history={workflowDetail?.history || []}
         currentNode={run.currentNode || workflowDetail?.current_node || ""}
         status={workflowDetail?.status || run.phase}

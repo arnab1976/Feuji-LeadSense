@@ -146,22 +146,80 @@ def get_lead(lead_id: str, db: Session = Depends(get_db),
 
 # -- verification workbench ------------------------------------------------
 @router.get("/verification/queue")
-def verification_queue(db: Session = Depends(get_db),
-                       user: CurrentUser = Depends(get_current_user)):
-    """Every open conflict, newest first. This is the workbench data source."""
-    rows = (db.query(LeadVerification, Lead)
-            .join(Lead, Lead.id == LeadVerification.lead_id)
-            .filter(LeadVerification.tenant_id == user.tenant_id,
-                    LeadVerification.status != "MATCH",
-                    LeadVerification.resolved_value == "")
-            .order_by(LeadVerification.confidence.asc()).all())
-    return [{
-        "verification_id": v.id, "lead_id": lead.id, "lead_name": lead.full_name,
-        "company": lead.company_name, "field": v.field,
-        "uploaded_value": v.uploaded_value, "extracted_value": v.extracted_value,
-        "status": v.status, "confidence": v.confidence, "reason": v.reason,
+def verification_queue(
+    workflow_id: str | None = None,
+    include_matches: bool = Query(default=False),
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(get_current_user),
+):
+    """Field-level verification rows for the workbench.
+
+    By default returns open conflicts only. Pass ``include_matches=true`` to
+    also include MATCH / auto-accepted rows (snapshot-style reconciliation table).
+    Optional ``workflow_id`` scopes rows to leads from the prior Agent 01 run.
+    """
+    stmt = (
+        db.query(LeadVerification, Lead)
+        .join(Lead, Lead.id == LeadVerification.lead_id)
+        .filter(LeadVerification.tenant_id == user.tenant_id)
+    )
+    if workflow_id:
+        stmt = stmt.filter(Lead.workflow_id == workflow_id)
+    if not include_matches:
+        stmt = stmt.filter(
+            LeadVerification.status != "MATCH",
+            LeadVerification.resolved_value == "",
+        )
+    rows = stmt.order_by(
+        Lead.full_name.asc(),
+        LeadVerification.field.asc(),
+        LeadVerification.confidence.asc(),
+    ).all()
+
+    items = [{
+        "verification_id": v.id,
+        "lead_id": lead.id,
+        "lead_name": lead.full_name,
+        "company": lead.company_name,
+        "field": v.field,
+        "uploaded_value": v.uploaded_value,
+        "extracted_value": v.extracted_value,
+        "status": v.status,
+        "confidence": v.confidence,
+        "reason": v.reason,
         "method": v.method,
+        "resolved_value": v.resolved_value or "",
+        "resolved_source": v.resolved_source or "",
+        "resolved_by": v.resolved_by or "",
+        "workflow_id": lead.workflow_id or "",
     } for v, lead in rows]
+
+    match = sum(1 for i in items if i["status"] == "MATCH")
+    mismatch = sum(
+        1 for i in items
+        if i["status"] == "MISMATCH" and not i["resolved_value"]
+    )
+    needs_review = sum(
+        1 for i in items
+        if i["status"] == "NEEDS_REVIEW" and not i["resolved_value"]
+    )
+    resolved = sum(
+        1 for i in items
+        if i["resolved_source"] in ("uploaded", "extracted", "custom")
+        and i["status"] != "MATCH"
+    )
+    return {
+        "workflow_id": workflow_id or "",
+        "stats": {
+            "match": match,
+            "mismatch": mismatch,
+            "needs_review": needs_review,
+            "resolved": resolved,
+            "open": mismatch + needs_review,
+            "total": len(items),
+        },
+        "items": items,
+    }
 
 
 @router.post("/verification/resolve")

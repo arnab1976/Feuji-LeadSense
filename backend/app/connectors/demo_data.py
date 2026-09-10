@@ -1,16 +1,25 @@
-"""Synthetic records so every connector works before credentials exist.
+"""Synthetic records and demo canonical profiles for Verification demos.
 
-This is what makes ``git clone && make seed && make api`` produce a full working
-demo. Nothing here is real data.
+``DEMO_DATA_ACTIVE`` gates the old in-memory ``demo_leads()`` people list
+(connector demo-mode without credentials). Leave it False when using CSV
+fixtures instead.
 
-Uploaded titles deliberately differ from canonical titles for many records so
-Verification produces MATCH / MISMATCH / NEEDS_REVIEW cases.
+``CANONICAL_PROFILES_ACTIVE`` applies uploaded→canonical expansions so
+Verification can surface MATCH / MISMATCH / NEEDS_REVIEW on fixture data
+(e.g. BFSI prospect list: VP Operations vs Vice President — Banking Operations).
 """
 from __future__ import annotations
 
 import hashlib
+import re
 
 from app.connectors.base import RawLead
+
+# In-memory connector demo people (empty while False).
+DEMO_DATA_ACTIVE = False
+
+# Company/title canonical expansions for fixture Verification demos.
+CANONICAL_PROFILES_ACTIVE = True
 
 # (name, uploaded_title, canonical_title, company, legal, city, industry, hc, tech)
 _PEOPLE = [
@@ -50,7 +59,6 @@ _PEOPLE = [
     ("Aisha Khan", "Chief Information Officer", "Chief Information Officer",
      "Quantile Labs", "Quantile Labs Corp", "Toronto", "IT services", 9800,
      ["Azure", "Snowflake"]),
-    # Workflow "Technology buyers" CSV people — mismatched titles for the human gate.
     ("Aisha Rahman", "VP Engineering", "Vice President of Engineering",
      "Nimbus Data", "Nimbus Data Inc", "Bengaluru", "Software", 720,
      ["Kubernetes", "AWS"]),
@@ -68,13 +76,120 @@ _PEOPLE = [
      ["React", "Postgres"]),
 ]
 
+# Fixture CSVs rotate person names; resolve canonical by company (+ optional title).
+# Aligns with salesforce_bfsi_prospect_list.csv and related demo fixtures.
+_CANONICAL_BY_COMPANY: dict[str, dict] = {
+    "northbridge bank": {
+        "company_name": "Northbridge Bank Ltd",
+        "location": "Mumbai",
+        "industry": "Banking",
+        "titles": {
+            "vp operations": "Vice President - Banking Operations",
+            "operations director": "Vice President - Banking Operations",
+        },
+    },
+    "vantage insurance": {
+        "company_name": "Vantage Insurance Group",
+        "location": "London",
+        "industry": "Insurance",
+        "titles": {
+            "head of claims technology": "Head of Claims Technology",
+        },
+    },
+    "aurum capital": {
+        "company_name": "Aurum Capital Partners",
+        "location": "Singapore",
+        "industry": "Asset management",
+        "titles": {
+            "director of data": "Director of Data & Analytics",
+            "director, data": "Director of Data & Analytics",
+            "data strategy head": "Director of Data & Analytics",
+        },
+    },
+    "crestline bank": {
+        "company_name": "Crestline Bank PJSC",
+        "location": "Dubai",
+        "industry": "Banking",
+        "titles": {
+            "chief risk officer": "Senior Manager - Risk Analytics",
+            "manager, risk": "Senior Manager - Risk Analytics",
+            "manager risk": "Senior Manager - Risk Analytics",
+        },
+    },
+    "helvetia trust": {
+        "company_name": "Helvetia Trust AG",
+        "location": "Zurich",
+        "industry": "Banking",
+        "titles": {
+            "chief data officer": "Chief Data Officer",
+        },
+    },
+    "silverline mutual": {
+        "company_name": "Silverline Mutual Fund",
+        "location": "Pune",
+        "industry": "Asset management",
+        "titles": {
+            "lifecycle marketing lead": "Associate - Operations Support",
+            "associate": "Associate - Operations Support",
+        },
+    },
+    "nordkyst forsikring": {
+        "company_name": "Nordkyst Forsikring AS",
+        "titles": {"cto": "Chief Technology Officer"},
+    },
+    "ridgeway assurance": {
+        "company_name": "Ridgeway Assurance Plc",
+        "titles": {
+            "head of underwriting": "Head of Underwriting Operations",
+        },
+    },
+    "baltica pharma": {
+        "company_name": "Baltica Pharma A/S",
+        "titles": {
+            "head of manufacturing it": "Head of Manufacturing IT",
+        },
+    },
+    "nimbus data": {
+        "company_name": "Nimbus Data Inc",
+        "titles": {"vp engineering": "Vice President of Engineering"},
+    },
+    "orbitly": {
+        "company_name": "Orbitly Pte Ltd",
+        "titles": {
+            "director of platform": "Director, Platform Engineering",
+            "director platform": "Director, Platform Engineering",
+        },
+    },
+    "stacklane": {
+        "company_name": "Stacklane Technologies Ltd",
+        "titles": {
+            "head of data": "Head of Data Platform",
+        },
+    },
+    "brightops": {
+        "company_name": "BrightOps Inc",
+        "titles": {"cto": "Chief Technology Officer"},
+    },
+    "quantora": {
+        "company_name": "Quantora GmbH",
+        "titles": {"vp product": "Vice President of Product"},
+    },
+}
+
 
 def _slug(value: str) -> str:
     return "".join(ch for ch in value.lower() if ch.isalnum() or ch == " ").replace(" ", ".")
 
 
+def _norm_key(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
 def demo_leads(source: str, limit: int = 100, offset: int = 0) -> list[RawLead]:
-    """Deterministic synthetic leads."""
+    """Deterministic synthetic leads. Empty while ``DEMO_DATA_ACTIVE`` is False."""
+    if not DEMO_DATA_ACTIVE:
+        return []
+
     leads: list[RawLead] = []
     window = (_PEOPLE + _PEOPLE)[offset:offset + limit]
     for idx, (name, uploaded_title, _canonical, company, legal, city,
@@ -99,8 +214,38 @@ def demo_leads(source: str, limit: int = 100, offset: int = 0) -> list[RawLead]:
     return leads
 
 
-def canonical_profile(full_name: str) -> dict:
-    """The 'extracted' view of a demo person, used by the Extraction agent."""
+def canonical_profile(
+    full_name: str = "",
+    *,
+    title: str = "",
+    company_name: str = "",
+) -> dict:
+    """Return a demo 'extracted' profile when a known company/title (or person) matches.
+
+    Fixture CSVs rotate names (Aarav Mehta, …); lookup is primarily by company.
+    """
+    if not CANONICAL_PROFILES_ACTIVE:
+        return {}
+
+    company_key = _norm_key(company_name)
+    entry = _CANONICAL_BY_COMPANY.get(company_key)
+    if entry:
+        title_key = _norm_key(title)
+        titles: dict = entry.get("titles") or {}
+        canonical_title = titles.get(title_key) or title
+        return {
+            "full_name": full_name,
+            "title": canonical_title,
+            "company_name": entry.get("company_name") or company_name,
+            "location": entry.get("location") or "",
+            "industry": entry.get("industry") or "",
+            "employee_count": entry.get("employee_count", 0),
+            "tech_stack": entry.get("tech_stack") or [],
+        }
+
+    if not DEMO_DATA_ACTIVE:
+        return {}
+
     for (name, _uploaded, canonical, company, legal, city, industry,
          headcount, tech) in _PEOPLE:
         if name == full_name:
@@ -113,4 +258,6 @@ def canonical_profile(full_name: str) -> dict:
 
 
 def demo_people_names() -> list[str]:
+    if not DEMO_DATA_ACTIVE:
+        return []
     return [row[0] for row in _PEOPLE]

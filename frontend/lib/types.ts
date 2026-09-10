@@ -61,6 +61,23 @@ export type Conflict = {
   confidence: number;
   reason: string;
   method: string;
+  resolved_value?: string;
+  resolved_source?: string;
+  resolved_by?: string;
+  workflow_id?: string;
+};
+
+export type VerificationWorkbench = {
+  workflow_id: string;
+  stats: {
+    match: number;
+    mismatch: number;
+    needs_review: number;
+    resolved: number;
+    open: number;
+    total: number;
+  };
+  items: Conflict[];
 };
 
 export type Campaign = {
